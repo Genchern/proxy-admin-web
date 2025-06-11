@@ -1,0 +1,22 @@
+ACL:
+  - 123456789
+tg_token: "7893876708:AAF9uGJhlVMbQUdlLUluXMLwe5Ku0_WF_7Y"
+tg_channel: 7437739190
+tg_acl:
+  - "7437739190"
+proxy_request_timeout: 10s
+config_reload_enabled: true
+auto_checks_enable: true
+on_add_checks_enable: true
+logs_verbose: info
+logs_dir: logs
+proxy_files:
+  - file: proxies/ru.txt
+    country: Russia
+  - file: proxies/us.txt
+    country: USA
+  - file: proxies/de.txt
+    country: Germany
+proxy_checks_default:
+  - url: https://ipinfo.io/json 
+    get_country: true

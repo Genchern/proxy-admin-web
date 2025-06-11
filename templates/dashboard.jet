@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Proxy Admin Panel</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>Proxy List by Country</h1>
+
+<form method="POST" action="/add-proxy">
+  <select name="country">
+    <option value="Russia">Russia</option>
+    <option value="USA">USA</option>
+  </select>
+  <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+  <select name="format">
+    <option value="1">Format 1: addr:port:user:pass</option>
+    <option value="2">Format 2: proto://addr:port:user:pass</option>
+    <option value="3">Format 3: user:pass@addr:port</option>
+    <option value="4">Format 4: proto://user:pass@addr:port</option>
+  </select>
+  <button type="submit">Add Proxy</button>
+</form>
+
+{{ range $country, $proxies := .Proxies }}
+  <h2>{{ $country }}</h2>
+  <ul>
+    {{ range $proxy := $proxies }}
+      <li>
+        {{ if eq (index $proxy 0) 'Q' }}
+          🟡 Quarantined: {{ substr $proxy 9 }} 
+          <a href="/dequarantine/{{$country}}/{{substr $proxy 9 }}">Restore</a>
+        {{ else if eq (index $proxy 0) 'a' }}
+          🔴 Autoquarantined: {{ $proxy }} 
+          <a href="/dequarantine/{{$country}}/{{$proxy}}">Restore</a>
+        {{ else }}
+          🟢 Active: {{ $proxy }}
+          <a href="/quarantine/{{$country}}/{{$proxy}}"> Quarantine</a>
+          <a href="/delete/{{$country}}/{{$proxy}}">Delete</a>
+        {{ end }}
+      </li>
+    {{ end }}
+  </ul>
+{{ end }}
+</body>
+</html>
