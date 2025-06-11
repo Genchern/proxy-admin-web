@@ -11,8 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/template/jet"
+	"github.com/gofiber/fiber/v3"
 )
 
 // ProxyFile связывает страну с файлом
@@ -29,20 +28,97 @@ var proxyFiles = []ProxyFile{
 var mu sync.Mutex
 
 func main() {
-	engine := jet.New("./templates", ".jet")
-	app := fiber.New(fiber.Config{Views: engine})
+	app := fiber.New()
 
-	// Статика
-	app.Static("/static", "./static")
+	// Обслуживание статики (заменяет app.Static)
+	app.Use("/static/", func(c fiber.Ctx) error {
+		return c.SendFile("./static" + c.Path()[len("/static"):])
+	})
 
-	// Главная страница
-	app.Get("/", dashboard)
-	app.Post("/add-proxy", addProxy)
-	app.Get("/delete/:country/:proxy", deleteProxy)
-	app.Get("/quarantine/:country/:proxy", quarantineProxy)
-	app.Get("/dequarantine/:country/:proxy", dequarantineProxy)
+	// Главная страница — выводим HTML напрямую
+	app.Get("/", func(c fiber.Ctx) error {
+		html := `
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8">
+    <title>Proxy Admin Panel</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <h1>Proxy List by Country</h1>
 
-	// Запуск авто-карантина
+    <form method="POST" action="/add-proxy">
+        <select name="country">
+            <option value="Russia">Russia</option>
+            <option value="USA">USA</option>
+        </select>
+        <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+        <select name="format">
+            <option value="1">Format 1: addr:port:user:pass</option>
+            <option value="2">Format 2: proto://addr:port:user:pass</option>
+            <option value="3">Format 3: user:pass@addr:port</option>
+            <option value="4">Format 4: proto://user:pass@addr:port</option>
+        </select>
+        <button type="submit">Add Proxy</button>
+    </form>
+
+    <h2>Russia</h2>
+    <ul>
+        <li>🟢 Active: 1.2.3.4:8080:user:pass <a href="/quarantine/Russia/1.2.3.4:8080:user:pass"> Quarantine</a> <a href="/delete/Russia/1.2.3.4:8080:user:pass">Delete</a></li>
+        <li>🟡 Quarantined: 9.9.9.9:8080:user:pass <a href="/dequarantine/Russia/9.9.9.9:8080:user:pass">Restore</a></li>
+    </ul>
+
+    <h2>USA</h2>
+    <ul>
+        <li>🔴 Autoquarantined: 8.8.8.8:8080:user:pass <a href="/dequarantine/USA/8.8.8.8:8080:user:pass">Restore</a></li>
+    </ul>
+
+</body>
+</html>
+`
+		// Указываем тип контента как HTML
+		return c.Type("html").SendString(html)
+	})
+
+	// Пример POST-маршрута
+	app.Post("/add-proxy", func(c fiber.Ctx) error {
+		country := c.FormValue("country")
+		proxy := c.FormValue("proxy")
+		format := c.FormValue("format")
+
+		log.Printf("Добавлен прокси: %s -> %s (формат %s)", country, proxy, format)
+
+		// Здесь будет логика добавления прокси в файл
+		return c.Redirect().To("/dashboard")
+	})
+
+	// Пример маршрутов с параметрами
+	app.Get("/delete/:country/:proxy", func(c fiber.Ctx) error {
+		country := c.Params("country")
+		proxy := c.Params("proxy")
+		log.Printf("Удалён прокси: %s -> %s", country, proxy)
+
+		return c.Redirect().To("/dashboard")
+	})
+
+	app.Get("/quarantine/:country/:proxy", func(c fiber.Ctx) error {
+		country := c.Params("country")
+		proxy := c.Params("proxy")
+		log.Printf("Прокси переведён в карантин: %s -> %s", country, proxy)
+
+		return c.Redirect().To("/dashboard")
+	})
+
+	app.Get("/dequarantine/:country/:proxy", func(c fiber.Ctx) error {
+		country := c.Params("country")
+		proxy := c.Params("proxy")
+		log.Printf("Прокси восстановлен из карантина: %s -> %s", country, proxy)
+
+		return c.Redirect().To("/dashboard")
+	})
+
+	// Запуск авто-карантина (заглушка)
 	go autoQuarantineCheck()
 
 	log.Println("Server started on http://localhost:3000")
@@ -156,10 +232,12 @@ func outAutoQuarantine(filename, proxy string) error {
 }
 
 // handlers/proxy_handlers.go
-func dashboard(c *fiber.Ctx) error {
+
+func dashboard(c fiber.Ctx) error {
+
 	auth := c.Cookies("auth") != ""
 	if !auth {
-		c.Redirect("/")
+		c.Redirect().To("/")
 	}
 
 	proxyMap := make(map[string][]string)
@@ -168,12 +246,82 @@ func dashboard(c *fiber.Ctx) error {
 		proxyMap[pf.Country] = proxies
 	}
 
-	return c.Render("index", fiber.Map{
-		"Proxies": proxyMap,
-	})
+	// Генерация HTML вручную
+	var html strings.Builder
+
+	html.WriteString(`<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Proxy Admin Panel</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<h1>Proxy List by Country</h1>
+
+<form method="POST" action="/add-proxy">
+<select name="country">
+<option value="Russia">Russia</option>
+<option value="USA">USA</option>
+</select>
+<input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+<select name="format">
+<option value="1">Format 1: addr:port:user:pass</option>
+<option value="2">Format 2: proto://addr:port:user:pass</option>
+<option value="3">Format 3: user:pass@addr:port</option>
+<option value="4">Format 4: proto://user:pass@addr:port</option>
+</select>
+<button type="submit">Add Proxy</button>
+</form>`)
+
+	for country, proxies := range proxyMap {
+		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
+		for _, proxy := range proxies {
+			html.WriteString("<li>")
+
+			if len(proxy) > 8 && proxy[:9] == "quarantine " {
+				cleanProxy := proxy[9:]
+				html.WriteString(fmt.Sprintf("🟡 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
+					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
+			} else if strings.HasPrefix(proxy, "autoquarantine ") {
+				cleanProxy := strings.TrimPrefix(proxy, "autoquarantine ")
+				html.WriteString(fmt.Sprintf("🔴 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
+					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
+			} else {
+				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
+					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+			}
+
+			html.WriteString("</li>")
+		}
+		html.WriteString("</ul>")
+	}
+
+	html.WriteString(`</body></html>`)
+
+	// Установите тип контента на HTML
+	return c.Type("html", "utf-8").SendString(html.String())
+
 }
 
-func deleteProxy(c *fiber.Ctx) error {
+// func dashboard(c fiber.Ctx) error {
+// 	auth := c.Cookies("auth") != ""
+// 	if !auth {
+// 		c.Redirect().To("/")
+// 	}
+
+// 	proxyMap := make(map[string][]string)
+// 	for _, pf := range proxyFiles {
+// 		proxies, _ := getProxiesFromFile(pf.File)
+// 		proxyMap[pf.Country] = proxies
+// 	}
+
+// 	return c.Render("index", fiber.Map{
+// 		"Proxies": proxyMap,
+// 	})
+// }
+
+func deleteProxy(c fiber.Ctx) error {
 	country := c.Params("country")
 	proxy := c.Params("proxy")
 	for _, pf := range proxyFiles {
@@ -181,10 +329,10 @@ func deleteProxy(c *fiber.Ctx) error {
 			removeProxyFromFile(pf.File, proxy)
 		}
 	}
-	return c.Redirect("/dashboard")
+	return c.Redirect().To("/dashboard")
 }
 
-func quarantineProxy(c *fiber.Ctx) error {
+func quarantineProxy(c fiber.Ctx) error {
 	country := c.Params("country")
 	proxy := c.Params("proxy")
 	for _, pf := range proxyFiles {
@@ -192,10 +340,10 @@ func quarantineProxy(c *fiber.Ctx) error {
 			setquarantineProxyFromFile(pf.File, proxy)
 		}
 	}
-	return c.Redirect("/dashboard")
+	return c.Redirect().To("/dashboard")
 }
 
-func dequarantineProxy(c *fiber.Ctx) error {
+func dequarantineProxy(c fiber.Ctx) error {
 	country := c.Params("country")
 	proxy := c.Params("proxy")
 	for _, pf := range proxyFiles {
@@ -203,10 +351,10 @@ func dequarantineProxy(c *fiber.Ctx) error {
 			outquarantineProxyFromFile(pf.File, proxy)
 		}
 	}
-	return c.Redirect("/dashboard")
+	return c.Redirect().To("/dashboard")
 }
 
-func addProxy(c *fiber.Ctx) error {
+func addProxy(c fiber.Ctx) error {
 	country := c.FormValue("country")
 	proxy := c.FormValue("proxy")
 	format := c.FormValue("format")
@@ -239,10 +387,10 @@ func addProxy(c *fiber.Ctx) error {
 			addProxyToFile(pf.File, proxy)
 		}
 	}
-	return c.Redirect("/")
+	return c.Redirect().To("/")
 }
 
-func logs(c *fiber.Ctx) error {
+func logs(c fiber.Ctx) error {
 	logData, err := os.ReadFile("logs/unsuccessful")
 	if err != nil {
 		return c.SendString("Failed to read log file")
