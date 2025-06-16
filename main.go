@@ -322,10 +322,10 @@ func outAutoQuarantine(filename, proxy string) error {
 
 // handlers/proxy_handlers.go
 func dashboard(c fiber.Ctx) error {
-	// auth := c.Cookies("auth") != ""
-	// if !auth {
-	// 	return c.Redirect().To("/")
-	// }
+	auth := c.Cookies("auth") != ""
+	if !auth {
+		return c.Redirect().To("/")
+	}
 
 	// Получаем сообщение из куки
 	flashMsg := c.Cookies("flash", "")
