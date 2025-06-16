@@ -32,3 +32,8 @@ button {
     padding: 10px 20px;
     margin-top: 10px;
 }
+
+#flashMessage {
+    font-family: sans-serif;
+    font-size: 14px;
+}

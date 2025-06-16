@@ -35,50 +35,99 @@ func main() {
 		return c.SendFile("./static" + c.Path()[len("/static"):])
 	})
 
+	// // Главная страница перенаправляет на /dashboard
+	// app.Get("/", func(c fiber.Ctx) error {
+	// 	return c.Redirect().To("/dashboard")
+	// })
+
 	// Главная страница — выводим HTML напрямую
+	// app.Get("/", func(c fiber.Ctx) error {
+	// 	html := `
+	// 		<!DOCTYPE html>
+	// 		<html>
+	// 		<head>
+	// 			<meta charset="UTF-8">
+	// 			<title>Proxy Admin Panel</title>
+	// 			<link rel="stylesheet" href="/static/style.css">
+	// 		</head>
+	// 		<body>
+	// 			<h1>Proxy List by Country</h1>
+	// 			<h2>Add Proxy</h2>
+
+	// 			<form method="POST" action="/add-proxy">
+	// 				<select name="country">
+	// 					<option value="Russia">Russia</option>
+	// 					<option value="USA">USA</option>
+	// 				</select>
+	// 				<input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+	// 				<select name="format">
+	// 					<option value="1">Format 1: addr:port:user:pass</option>
+	// 					<option value="2">Format 2: proto://addr:port:user:pass</option>
+	// 					<option value="3">Format 3: user:pass@addr:port</option>
+	// 					<option value="4">Format 4: proto://user:pass@addr:port</option>
+	// 				</select>
+	// 				<button type="submit">Add Proxy</button>
+	// 			</form>
+
+	// 			<h2>Add Country</h2>
+	// 			<form method="POST" action="/add-country">
+	// 					<input type="text" name="countryName" placeholder="Country Name (e.g., Germany)" required>
+	// 					<input type="text" name="countryCode" placeholder="Country Code (e.g., DE)" required>
+	// 					<button type="submit">Add Country</button>
+	// 			</form>
+
+	// 			<h2>Russia</h2>
+	// 			<ul>
+	// 				<li>🟢 Active: 1.2.3.4:8080:user:pass <a href="/quarantine/Russia/1.2.3.4:8080:user:pass"> Quarantine</a> <a href="/delete/Russia/1.2.3.4:8080:user:pass">Delete</a></li>
+	// 				<li>🟡 Quarantined: 9.9.9.9:8080:user:pass <a href="/dequarantine/Russia/9.9.9.9:8080:user:pass">Restore</a></li>
+	// 			</ul>
+
+	// 			<h2>USA</h2>
+	// 			<ul>
+	// 				<li>🔴 Autoquarantined: 8.8.8.8:8080:user:pass <a href="/dequarantine/USA/8.8.8.8:8080:user:pass">Restore</a></li>
+	// 			</ul>
+
+	// 		</body>
+	// 		</html>
+	// `
+	// 	// Указываем тип контента как HTML
+	// 	return c.Type("html").SendString(html)
+	// })
+
 	app.Get("/", func(c fiber.Ctx) error {
 		html := `
-<!DOCTYPE html>
-<html>
-<head>
-	<meta charset="UTF-8">
-    <title>Proxy Admin Panel</title>
-    <link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
-    <h1>Proxy List by Country</h1>
-
-    <form method="POST" action="/add-proxy">
-        <select name="country">
-            <option value="Russia">Russia</option>
-            <option value="USA">USA</option>
-        </select>
-        <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
-        <select name="format">
-            <option value="1">Format 1: addr:port:user:pass</option>
-            <option value="2">Format 2: proto://addr:port:user:pass</option>
-            <option value="3">Format 3: user:pass@addr:port</option>
-            <option value="4">Format 4: proto://user:pass@addr:port</option>
-        </select>
-        <button type="submit">Add Proxy</button>
-    </form>
-
-    <h2>Russia</h2>
-    <ul>
-        <li>🟢 Active: 1.2.3.4:8080:user:pass <a href="/quarantine/Russia/1.2.3.4:8080:user:pass"> Quarantine</a> <a href="/delete/Russia/1.2.3.4:8080:user:pass">Delete</a></li>
-        <li>🟡 Quarantined: 9.9.9.9:8080:user:pass <a href="/dequarantine/Russia/9.9.9.9:8080:user:pass">Restore</a></li>
-    </ul>
-
-    <h2>USA</h2>
-    <ul>
-        <li>🔴 Autoquarantined: 8.8.8.8:8080:user:pass <a href="/dequarantine/USA/8.8.8.8:8080:user:pass">Restore</a></li>
-    </ul>
-
-</body>
-</html>
-`
-		// Указываем тип контента как HTML
+	<!DOCTYPE html>
+	<html>
+	<head><title>Login</title></head>
+	<body>
+		<h2>Proxy Admin Panel</h2>
+		<form method="POST" action="/login">
+			<input type="text" name="username" placeholder="Username" required>
+			<input type="password" name="password" placeholder="Password" required>
+			<button type="submit">Login</button>
+		</form>
+	</body>
+	</html>`
 		return c.Type("html").SendString(html)
+	})
+
+	app.Post("/login", func(c fiber.Ctx) error {
+		username := c.FormValue("username")
+		password := c.FormValue("password")
+
+		// Пример простой проверки
+		if username == "admin" && password == "123456" {
+			c.Cookie(&fiber.Cookie{
+				Name:     "auth",
+				Value:    "true",
+				Expires:  time.Now().Add(24 * time.Hour),
+				HTTPOnly: true,
+				SameSite: "Lax",
+			})
+			return c.Redirect().To("/dashboard")
+		}
+
+		return c.SendString("Invalid credentials")
 	})
 
 	// Пример POST-маршрута
@@ -90,6 +139,43 @@ func main() {
 		log.Printf("Добавлен прокси: %s -> %s (формат %s)", country, proxy, format)
 
 		// Здесь будет логика добавления прокси в файл
+		return c.Redirect().To("/dashboard")
+	})
+
+	// Добавление новой страны с созданием соотвествующейго файла "Country Code"_proxies в папке proxies
+	app.Post("/add-country", func(c fiber.Ctx) error {
+		countryName := c.FormValue("countryName")
+		countryCode := strings.ToLower(c.FormValue("countryCode"))
+
+		if countryName == "" || countryCode == "" {
+			return c.SendString("Both fields are required.")
+		}
+
+		filename := fmt.Sprintf("proxies/%s_proxies.txt", countryCode)
+
+		file, err := os.Create(filename)
+		if err != nil {
+			log.Printf("Error creating file %s: %v", filename, err)
+			return c.SendString(fmt.Sprintf("Could not create file: %v", err))
+		}
+		defer file.Close()
+
+		mu.Lock()
+		proxyFiles = append(proxyFiles, ProxyFile{
+			File:    filename,
+			Country: countryName,
+		})
+		mu.Unlock()
+
+		// Сохраняем сообщение в куке
+		c.Cookie(&fiber.Cookie{
+			Name:     "flash",
+			Value:    "✅ Страна " + countryName + " (" + countryCode + ") добавлена",
+			Expires:  time.Now().Add(10 * time.Second),
+			HTTPOnly: true,
+			SameSite: "Lax",
+		})
+
 		return c.Redirect().To("/dashboard")
 	})
 
@@ -117,6 +203,9 @@ func main() {
 
 		return c.Redirect().To("/dashboard")
 	})
+
+	// Дашборд
+	app.Get("/dashboard", dashboard)
 
 	// Запуск авто-карантина (заглушка)
 	go autoQuarantineCheck()
@@ -232,12 +321,23 @@ func outAutoQuarantine(filename, proxy string) error {
 }
 
 // handlers/proxy_handlers.go
-
 func dashboard(c fiber.Ctx) error {
+	// auth := c.Cookies("auth") != ""
+	// if !auth {
+	// 	return c.Redirect().To("/")
+	// }
 
-	auth := c.Cookies("auth") != ""
-	if !auth {
-		c.Redirect().To("/")
+	// Получаем сообщение из куки
+	flashMsg := c.Cookies("flash", "")
+	if flashMsg != "" {
+		// Удаляем куку после чтения
+		c.Cookie(&fiber.Cookie{
+			Name:     "flash",
+			Value:    "",
+			Expires:  time.Now().Add(-time.Hour),
+			HTTPOnly: true,
+			SameSite: "Lax",
+		})
 	}
 
 	proxyMap := make(map[string][]string)
@@ -246,7 +346,6 @@ func dashboard(c fiber.Ctx) error {
 		proxyMap[pf.Country] = proxies
 	}
 
-	// Генерация HTML вручную
 	var html strings.Builder
 
 	html.WriteString(`<!DOCTYPE html>
@@ -256,14 +355,45 @@ func dashboard(c fiber.Ctx) error {
 <title>Proxy Admin Panel</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body>`)
+
+	// Выводим сообщение, если оно есть
+	if flashMsg != "" {
+		html.WriteString(fmt.Sprintf(`
+<div id="flashMessage" style="
+    position: fixed;
+    top: 20px;
+    right: 20px;
+    background-color: #d4edda;
+    color: #155724;
+    padding: 10px 20px;
+    border-radius: 5px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    z-index: 9999;
+    transition: opacity 0.5s;
+">%s</div>
+<script>
+    setTimeout(function() {
+        var msg = document.getElementById('flashMessage');
+        if (msg) {
+            msg.style.opacity = '0';
+            setTimeout(function() { msg.remove(); }, 500);
+        }
+    }, 3000);
+</script>`, flashMsg))
+	}
+
+	html.WriteString(`
 <h1>Proxy List by Country</h1>
 
 <form method="POST" action="/add-proxy">
-<select name="country">
-<option value="Russia">Russia</option>
-<option value="USA">USA</option>
-</select>
+<select name="country">`)
+
+	for _, pf := range proxyFiles {
+		html.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`, pf.Country, pf.Country))
+	}
+
+	html.WriteString(`</select>
 <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
 <select name="format">
 <option value="1">Format 1: addr:port:user:pass</option>
@@ -272,7 +402,15 @@ func dashboard(c fiber.Ctx) error {
 <option value="4">Format 4: proto://user:pass@addr:port</option>
 </select>
 <button type="submit">Add Proxy</button>
-</form>`)
+</form>
+
+<h2>Add Country</h2>
+<form method="POST" action="/add-country">
+<input type="text" name="countryName" placeholder="Country Name (e.g., Germany)" required>
+<input type="text" name="countryCode" placeholder="Country Code (e.g., DE)" required>
+<button type="submit">Add Country</button>
+</form>
+`)
 
 	for country, proxies := range proxyMap {
 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
@@ -299,15 +437,13 @@ func dashboard(c fiber.Ctx) error {
 
 	html.WriteString(`</body></html>`)
 
-	// Установите тип контента на HTML
 	return c.Type("html", "utf-8").SendString(html.String())
-
 }
 
 // func dashboard(c fiber.Ctx) error {
 // 	auth := c.Cookies("auth") != ""
 // 	if !auth {
-// 		c.Redirect().To("/")
+// 		return c.Redirect().To("/")
 // 	}
 
 // 	proxyMap := make(map[string][]string)
@@ -316,9 +452,94 @@ func dashboard(c fiber.Ctx) error {
 // 		proxyMap[pf.Country] = proxies
 // 	}
 
-// 	return c.Render("index", fiber.Map{
-// 		"Proxies": proxyMap,
-// 	})
+// 	// Генерация HTML вручную
+// 	var html strings.Builder
+
+// 	// Получаем сообщение из query-параметра
+// 	message := c.Query("message")
+
+// 	html.WriteString(`<!DOCTYPE html>
+// 	<html>
+// 	<head>
+// 	<meta charset="UTF-8">
+// 	<title>Proxy Admin Panel</title>
+// 	<link rel="stylesheet" href="/static/style.css">
+// 	</head>
+// 	<body>`)
+
+// 	// Выводим сообщение, если оно есть
+// 	if message != "" {
+// 		// Экранируем для безопасности
+// 		safeMessage := url.QueryEscape(message)
+// 		html.WriteString(fmt.Sprintf(`
+// 	<div id="flashMessage" style="
+// 		position: fixed;
+// 		top: 20px;
+// 		right: 20px;
+// 		background-color: #d4edda;
+// 		color: #155724;
+// 		padding: 10px 20px;
+// 		border-radius: 5px;
+// 		box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+// 		z-index: 9999;
+// 		transition: opacity 0.5s;
+// 	">%s</div>
+// 	<script>
+// 		setTimeout(function() {
+// 			var msg = document.getElementById('flashMessage');
+// 			if (msg) {
+// 				msg.style.opacity = '0';
+// 				setTimeout(function() { msg.remove(); }, 500);
+// 			}
+// 		}, 3000);
+// 	</script>`, safeMessage))
+// 	}
+
+// 	// Основной контент
+// 	html.WriteString(`
+// 	<h1>Proxy List by Country</h1>
+
+// 	<form method="POST" action="/add-proxy">
+// 	<select name="country">
+// 	<option value="Russia">Russia</option>
+// 	<option value="USA">USA</option>
+// 	</select>
+// 	<input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+// 	<select name="format">
+// 	<option value="1">Format 1: addr:port:user:pass</option>
+// 	<option value="2">Format 2: proto://addr:port:user:pass</option>
+// 	<option value="3">Format 3: user:pass@addr:port</option>
+// 	<option value="4">Format 4: proto://user:pass@addr:port</option>
+// 	</select>
+// 	<button type="submit">Add Proxy</button>
+// 	</form>`)
+
+// 	for country, proxies := range proxyMap {
+// 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
+// 		for _, proxy := range proxies {
+// 			html.WriteString("<li>")
+
+// 			if len(proxy) > 8 && proxy[:9] == "quarantine " {
+// 				cleanProxy := proxy[9:]
+// 				html.WriteString(fmt.Sprintf("🟡 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
+// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
+// 			} else if strings.HasPrefix(proxy, "autoquarantine ") {
+// 				cleanProxy := strings.TrimPrefix(proxy, "autoquarantine ")
+// 				html.WriteString(fmt.Sprintf("🔴 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
+// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
+// 			} else {
+// 				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
+// 					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+// 			}
+
+// 			html.WriteString("</li>")
+// 		}
+// 		html.WriteString("</ul>")
+// 	}
+
+// 	html.WriteString(`</body></html>`)
+
+// 	return c.Type("html", "utf-8").SendString(html.String())
 // }
 
 func deleteProxy(c fiber.Ctx) error {
