@@ -20,79 +20,21 @@ type ProxyFile struct {
 	Country string
 }
 
-var proxyFiles = []ProxyFile{
-	{"proxies/ru.txt", "Russia"},
-	{"proxies/us.txt", "USA"},
-}
+var (
+	proxyFiles []ProxyFile
+	filesMutex sync.RWMutex // безопасность при обновлениях
+)
 
 var mu sync.Mutex
 
 func main() {
+	loadProxyFiles() // первый раз загружаем файлы
 	app := fiber.New()
 
 	// Обслуживание статики (заменяет app.Static)
 	app.Use("/static/", func(c fiber.Ctx) error {
 		return c.SendFile("./static" + c.Path()[len("/static"):])
 	})
-
-	// // Главная страница перенаправляет на /dashboard
-	// app.Get("/", func(c fiber.Ctx) error {
-	// 	return c.Redirect().To("/dashboard")
-	// })
-
-	// Главная страница — выводим HTML напрямую
-	// app.Get("/", func(c fiber.Ctx) error {
-	// 	html := `
-	// 		<!DOCTYPE html>
-	// 		<html>
-	// 		<head>
-	// 			<meta charset="UTF-8">
-	// 			<title>Proxy Admin Panel</title>
-	// 			<link rel="stylesheet" href="/static/style.css">
-	// 		</head>
-	// 		<body>
-	// 			<h1>Proxy List by Country</h1>
-	// 			<h2>Add Proxy</h2>
-
-	// 			<form method="POST" action="/add-proxy">
-	// 				<select name="country">
-	// 					<option value="Russia">Russia</option>
-	// 					<option value="USA">USA</option>
-	// 				</select>
-	// 				<input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
-	// 				<select name="format">
-	// 					<option value="1">Format 1: addr:port:user:pass</option>
-	// 					<option value="2">Format 2: proto://addr:port:user:pass</option>
-	// 					<option value="3">Format 3: user:pass@addr:port</option>
-	// 					<option value="4">Format 4: proto://user:pass@addr:port</option>
-	// 				</select>
-	// 				<button type="submit">Add Proxy</button>
-	// 			</form>
-
-	// 			<h2>Add Country</h2>
-	// 			<form method="POST" action="/add-country">
-	// 					<input type="text" name="countryName" placeholder="Country Name (e.g., Germany)" required>
-	// 					<input type="text" name="countryCode" placeholder="Country Code (e.g., DE)" required>
-	// 					<button type="submit">Add Country</button>
-	// 			</form>
-
-	// 			<h2>Russia</h2>
-	// 			<ul>
-	// 				<li>🟢 Active: 1.2.3.4:8080:user:pass <a href="/quarantine/Russia/1.2.3.4:8080:user:pass"> Quarantine</a> <a href="/delete/Russia/1.2.3.4:8080:user:pass">Delete</a></li>
-	// 				<li>🟡 Quarantined: 9.9.9.9:8080:user:pass <a href="/dequarantine/Russia/9.9.9.9:8080:user:pass">Restore</a></li>
-	// 			</ul>
-
-	// 			<h2>USA</h2>
-	// 			<ul>
-	// 				<li>🔴 Autoquarantined: 8.8.8.8:8080:user:pass <a href="/dequarantine/USA/8.8.8.8:8080:user:pass">Restore</a></li>
-	// 			</ul>
-
-	// 		</body>
-	// 		</html>
-	// `
-	// 	// Указываем тип контента как HTML
-	// 	return c.Type("html").SendString(html)
-	// })
 
 	app.Get("/", func(c fiber.Ctx) error {
 		html := `
@@ -151,7 +93,7 @@ func main() {
 			return c.SendString("Both fields are required.")
 		}
 
-		filename := fmt.Sprintf("proxies/%s_proxies.txt", countryCode)
+		filename := fmt.Sprintf("proxies/%s_proxies.txt", countryName)
 
 		file, err := os.Create(filename)
 		if err != nil {
@@ -160,18 +102,14 @@ func main() {
 		}
 		defer file.Close()
 
-		mu.Lock()
-		proxyFiles = append(proxyFiles, ProxyFile{
-			File:    filename,
-			Country: countryName,
-		})
-		mu.Unlock()
+		// Обновляем список файлов
+		loadProxyFiles()
 
 		// Сохраняем сообщение в куке
 		c.Cookie(&fiber.Cookie{
 			Name:     "flash",
 			Value:    "✅ Страна " + countryName + " (" + countryCode + ") добавлена",
-			Expires:  time.Now().Add(10 * time.Second),
+			Expires:  time.Now().Add(5 * time.Second),
 			HTTPOnly: true,
 			SameSite: "Lax",
 		})
@@ -212,6 +150,30 @@ func main() {
 
 	log.Println("Server started on http://localhost:3000")
 	app.Listen(":3000")
+}
+
+func loadProxyFiles() {
+	filesMutex.Lock()
+	defer filesMutex.Unlock()
+
+	proxyFiles = nil // очищаем перед перезагрузкой
+
+	files, err := os.ReadDir("proxies")
+	if err != nil {
+		log.Printf("Не могу прочитать папку proxies: %v", err)
+		return
+	}
+
+	for _, file := range files {
+		if !file.IsDir() && strings.HasSuffix(file.Name(), "_proxies.txt") {
+			countryCode := strings.TrimSuffix(file.Name(), "_proxies.txt")
+			countryName := strings.ToUpper(countryCode[:1]) + strings.ToLower(countryCode[1:])
+			proxyFiles = append(proxyFiles, ProxyFile{
+				File:    "proxies/" + file.Name(),
+				Country: countryName,
+			})
+		}
+	}
 }
 
 func autoQuarantineCheck() {
@@ -262,17 +224,47 @@ func getProxiesFromFile(filePath string) ([]string, error) {
 
 	lines := strings.Split(string(data), "\n")
 	var result []string
+
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "peer ") {
-			result = append(result, strings.TrimPrefix(line, "peer "))
+		if line == "" {
+			continue
 		}
-		if strings.HasPrefix(line, "autoquarantine ") {
-			result = append(result, "QUARANTINE "+strings.TrimPrefix(line, "autoquarantine "))
+
+		switch {
+		case strings.HasPrefix(line, "peer "):
+			result = append(result, strings.TrimPrefix(line, "peer "))
+
+		case strings.HasPrefix(line, "quarantine "):
+			result = append(result, "quarantine "+strings.TrimPrefix(line, "quarantine "))
+
+		case strings.HasPrefix(line, "autoquarantine "):
+			result = append(result, "autoquarantine "+strings.TrimPrefix(line, "autoquarantine "))
 		}
 	}
+
 	return result, nil
 }
+
+// func getProxiesFromFile(filePath string) ([]string, error) {
+// 	data, err := os.ReadFile(filePath)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	lines := strings.Split(string(data), "\n")
+// 	var result []string
+// 	for _, line := range lines {
+// 		line = strings.TrimSpace(line)
+// 		if strings.HasPrefix(line, "peer ") {
+// 			result = append(result, strings.TrimPrefix(line, "peer "))
+// 		}
+// 		if strings.HasPrefix(line, "autoquarantine ") {
+// 			result = append(result, "QUARANTINE "+strings.TrimPrefix(line, "autoquarantine "))
+// 		}
+// 	}
+// 	return result, nil
+// }
 
 func setAutoQuarantine(filename, proxy string) error {
 	mu.Lock()
@@ -388,11 +380,11 @@ func dashboard(c fiber.Ctx) error {
 
 <form method="POST" action="/add-proxy">
 <select name="country">`)
-
+	filesMutex.RLock()
 	for _, pf := range proxyFiles {
 		html.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`, pf.Country, pf.Country))
 	}
-
+	filesMutex.RUnlock()
 	html.WriteString(`</select>
 <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
 <select name="format">
@@ -417,12 +409,12 @@ func dashboard(c fiber.Ctx) error {
 		for _, proxy := range proxies {
 			html.WriteString("<li>")
 
-			if len(proxy) > 8 && proxy[:9] == "quarantine " {
-				cleanProxy := proxy[9:]
+			if strings.HasPrefix(proxy, "quarantine ") {
+				cleanProxy := proxy[11:] // убираем "quarantine "
 				html.WriteString(fmt.Sprintf("🟡 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
 			} else if strings.HasPrefix(proxy, "autoquarantine ") {
-				cleanProxy := strings.TrimPrefix(proxy, "autoquarantine ")
+				cleanProxy := proxy[14:] // убираем "autoquarantine "
 				html.WriteString(fmt.Sprintf("🔴 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
 			} else {
