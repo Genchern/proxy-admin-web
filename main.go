@@ -58,7 +58,7 @@ func main() {
 		password := c.FormValue("password")
 
 		// Пример простой проверки
-		if username == "admin" && password == "123456" {
+		if username == "admin" && password == "1111" {
 			c.Cookie(&fiber.Cookie{
 				Name:     "auth",
 				Value:    "true",
@@ -134,13 +134,15 @@ func main() {
 		return c.Redirect().To("/dashboard")
 	})
 
-	app.Get("/dequarantine/:country/:proxy", func(c fiber.Ctx) error {
-		country := c.Params("country")
-		proxy := c.Params("proxy")
-		log.Printf("Прокси восстановлен из карантина: %s -> %s", country, proxy)
+	// app.Get("/dequarantine/:country/:proxy", func(c fiber.Ctx) error {
+	// 	country := c.Params("country")
+	// 	proxy := c.Params("proxy")
+	// 	log.Printf("Прокси восстановлен из карантина: %s -> %s", country, proxy)
 
-		return c.Redirect().To("/dashboard")
-	})
+	// 	return c.Redirect().To("/dashboard")
+	// })
+
+	app.Get("/dequarantine/:country/:proxy", dequarantineProxy)
 
 	// Дашборд
 	app.Get("/dashboard", dashboard)
@@ -559,6 +561,7 @@ func quarantineProxy(c fiber.Ctx) error {
 func dequarantineProxy(c fiber.Ctx) error {
 	country := c.Params("country")
 	proxy := c.Params("proxy")
+
 	for _, pf := range proxyFiles {
 		if pf.Country == country {
 			outquarantineProxyFromFile(pf.File, proxy)
@@ -690,32 +693,37 @@ func setquarantineProxyFromFile(filename string, proxy string) error {
 
 	return nil
 }
-
 func outquarantineProxyFromFile(filename string, proxy string) error {
-	// Открываем файл для чтения
+	decodedProxy, err := url.QueryUnescape(proxy)
+	if err != nil {
+		decodedProxy = proxy
+	}
+
+	decodedProxy = strings.TrimSpace(decodedProxy)
+	fmt.Printf("Декодированный прокси: %s\n", decodedProxy)
+
+	mu.Lock()
+	defer mu.Unlock()
+
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
-	// Читаем содержимое файла построчно
 	var lines []string
 	scanner := bufio.NewScanner(file)
+
 	for scanner.Scan() {
 		line := scanner.Text()
-
-		// Проверяем, начинается ли строка с "quarantine "+proxy
-		if strings.HasPrefix(line, "quarantine "+proxy) {
-			// Заменяем "quarantine" на "peer"
-			line = strings.Replace(line, "quarantine", "peer", 1)
+		if strings.HasPrefix(line, "autoquarantine "+decodedProxy) {
+			line = "peer " + decodedProxy
+		} else if strings.HasPrefix(line, "quarantine "+decodedProxy) {
+			line = "peer " + decodedProxy
 		}
-
-		// Сохраняем строку (изменённую или нет)
 		lines = append(lines, line)
 	}
 
-	// Перезаписываем файл с обновлённым содержимым
 	err = os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
 	if err != nil {
 		return err
@@ -723,6 +731,83 @@ func outquarantineProxyFromFile(filename string, proxy string) error {
 
 	return nil
 }
+
+// func outquarantineProxyFromFile(filename string, proxy string) error {
+
+// 	fmt.Print(proxy)
+// 	// Открываем файл для чтения
+// 	file, err := os.Open(filename)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer file.Close()
+
+// 	// Читаем содержимое файла построчно
+// 	var lines []string
+// 	scanner := bufio.NewScanner(file)
+// 	for scanner.Scan() {
+// 		line := scanner.Text()
+
+// 		if strings.HasPrefix(line, "quarantine "+proxy) {
+// 			line = strings.Replace(line, "quarantine", "peer", 1)
+
+// 		}
+// 		// if strings.HasPrefix(line, "quarantine "+proxy) || strings.HasPrefix(line, "autoquarantine "+proxy) {
+// 		// 	line = "peer " + proxy // Восстанавливаем как peer
+// 		// }
+// 		lines = append(lines, line)
+// 	}
+
+// 	// Очищаем файл, чтобы перезаписать его
+// 	err = os.Truncate(filename, 0)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	// Открываем файл для записи
+// 	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer file.Close()
+
+// 	// Записываем все строки обратно в файл
+// 	for _, line := range lines {
+// 		_, err := file.WriteString(line + "\n")
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+// func outquarantineProxyFromFile(filename string, proxy string) error {
+// 	fmt.Print(filename, proxy)
+// 	file, err := os.Open(filename)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer file.Close()
+
+// 	var lines []string
+// 	scanner := bufio.NewScanner(file)
+
+// 	for scanner.Scan() {
+// 		line := scanner.Text()
+// 		if strings.HasPrefix(line, "quarantine "+proxy) || strings.HasPrefix(line, "autoquarantine "+proxy) {
+// 			line = "peer " + proxy // Восстанавливаем как peer
+// 		}
+// 		lines = append(lines, line)
+// 	}
+
+// 	err = os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	return nil
+// }
 
 func addProxyToFile(filename string, proxy string) error {
 	// Открываем файл в режиме дозаписи (Append), записи (Write) и создания при отсутствии (Create)

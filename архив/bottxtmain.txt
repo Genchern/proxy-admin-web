@@ -1,0 +1,2519 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/natefinch/lumberjack"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/viper"
+)
+
+type LogData struct {
+	Logger  *log.Logger
+	Message string
+}
+
+type ProxyGoroutine struct {
+	Url      string
+	Country  string
+	File     string
+	StopChan chan struct{}
+}
+
+type ConfigProxyFiles struct {
+	File    string `json:"file"`
+	Country string `json:"country"`
+}
+
+type ProxyCheckResponse struct {
+	Available bool
+	Country   string
+	Body      string
+	Error     error
+}
+
+type ConfigCountryCheck struct {
+	Enanled    bool   `json:"enabled"`
+	Type       string `json:"type"`
+	SelectData string `json:"selectData"`
+}
+
+type ConfigProxyCheck struct {
+	Url        string
+	GetCountry bool
+}
+
+type ConfigCore struct {
+	ACL        []int64            `json:"ACL"`
+	ProxyFiles []ConfigProxyFiles `json:"proxy_files"`
+	// ProxyChecks ConfigProxyChecks  `json:"ProxyChecks"`
+	LogsVerbose string `mapstructure:"logs_verbose"`
+	TgChannel   string `mapstructure:"tg_channel"`
+}
+
+var (
+	bot                         *tgbotapi.BotAPI
+	mu                          sync.Mutex
+	config                      ConfigCore
+	logsVerbose                 string
+	tgToken                     string
+	tgChannelID                 int64
+	tgAcl                       []int64
+	proxyRequestTimeout         time.Duration
+	configReloadEnabled         bool
+	reloadPeriod                time.Time
+	autoChecksEnable            bool
+	onAddChecksEnable           bool
+	proxyFiles                  []ConfigProxyFiles
+	proxyGoroutineList          []ProxyGoroutine
+	proxyGoroutineListFreeIDs   []int64
+	logsDir                     string
+	proxyChecksDefault          []ConfigProxyCheck
+	unsuccessfulCheckFileLogger lumberjack.Logger
+	logFileUnsuccess            *log.Logger
+	currentUnavailable          []ProxyGoroutine
+	currentOK                   []ProxyGoroutine
+	currentDifferentCountry     []ProxyGoroutine
+	uploadFileBlock             bool
+)
+
+func loadConfigFromViper() {
+	err := viper.Unmarshal(&config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	logsVerbose = viper.GetString("logs_verbose")
+	tgToken = viper.GetString("tg_token")
+	tgChannelID = viper.GetInt64("tg_channel")
+	preAcl := viper.GetStringSlice("tg_acl")
+	tgAcl = make([]int64, 0)
+	for _, v := range preAcl {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			log.Fatal(err)
+		}
+		tgAcl = append(tgAcl, id)
+	}
+	proxyRequestTimeout = viper.GetDuration("proxyRequestTimeout")
+	configReloadEnabled = viper.GetBool("config_reload_enabled")
+	autoChecksEnable = viper.GetBool("auto_checks_enable")
+	onAddChecksEnable = viper.GetBool("on_add_checks_enable")
+	logsDir = viper.GetString("logs_dir")
+	proxyChecksDefaultUnmarshal := viper.Get("proxy_checks.default").([]interface{})
+	for _, value := range proxyChecksDefaultUnmarshal {
+		var proxyCheck ConfigProxyCheck
+		data, _ := json.Marshal(value)
+		json.Unmarshal(data, &proxyCheck)
+		proxyChecksDefault = append(proxyChecksDefault, proxyCheck)
+	}
+	//	reloadPeriod = viper.Get("reloadEnabled").(time.Time)
+	rawProxyFiles := viper.Get("proxy_files")
+
+	proxyFiles = make([]ConfigProxyFiles, 0)
+	if rawProxyFiles != nil {
+		if proxyFileSlice, ok := rawProxyFiles.([]interface{}); ok {
+			for _, proxyFileItem := range proxyFileSlice {
+				if proxyFileItemMap, ok := proxyFileItem.(map[string]interface{}); ok {
+					var proxyFile ConfigProxyFiles
+					proxyFile.File = proxyFileItemMap["file"].(string)
+					proxyFile.Country = proxyFileItemMap["country"].(string)
+					proxyFiles = append(proxyFiles, proxyFile)
+
+				}
+			}
+		}
+	}
+	// fmt.Print(proxyFiles)
+}
+
+func main() {
+	flag.Parse()
+	viper.SetConfigName("config")
+	viper.AddConfigPath(".")
+	err := viper.ReadInConfig()
+	loadConfigFromViper()
+
+	switch logsVerbose {
+	case "trace":
+		log.SetLevel(log.TraceLevel)
+	case "debug":
+		log.SetLevel(log.DebugLevel)
+	case "info":
+		log.SetLevel(log.InfoLevel)
+	case "warn":
+		log.SetLevel(log.WarnLevel)
+	case "error":
+		log.SetLevel(log.ErrorLevel)
+	case "fatal":
+		log.SetLevel(log.FatalLevel)
+	case "":
+		log.SetLevel(log.InfoLevel)
+	default:
+		log.Fatal("Invalid verbosity level")
+	}
+
+	unsuccessfulCheckFileLogger = lumberjack.Logger{
+		Filename:   fmt.Sprintf("%s/unsuccessful", logsDir),
+		MaxSize:    1,  // максимальный размер файла в мегабайтах
+		MaxBackups: 30, // количество бэкапов
+		MaxAge:     1,  // максимальный возраст файла в днях
+		Compress:   false,
+	}
+
+	logFileUnsuccess = log.New()
+	logFileUnsuccess.SetOutput(&unsuccessfulCheckFileLogger)
+	logFileUnsuccess.SetLevel(log.InfoLevel)
+
+	if configReloadEnabled {
+		viper.WatchConfig()
+		viper.OnConfigChange(func(in fsnotify.Event) {
+			loadConfigFromViper()
+			log.Info("Config reloaded")
+		})
+		log.Info("Config auto-reload enabled")
+	} else {
+		log.Info("Config auto-reload disabled")
+	}
+
+	if tgToken == "" || tgChannelID == 0 {
+		log.Fatal("Token and channel ID must be set")
+	}
+
+	http.DefaultTransport = &http.Transport{
+		TLSHandshakeTimeout: proxyRequestTimeout,
+	}
+
+	// Load config from file
+	uploadFileBlock = false
+	countriesList := make([]string, 0)
+
+	for _, proxyFile := range proxyFiles {
+		country := proxyFile.Country
+		countriesList = append(countriesList, country)
+	}
+
+	// Create Telegram bot
+	bot, err = tgbotapi.NewBotAPI(tgToken)
+	if err != nil {
+		log.Fatal("Failed to create Telegram bot", err)
+	}
+
+	// Start checking proxies
+	if autoChecksEnable == true {
+		log.Info("Peers checks enabled")
+		proxyGoroutineList = make([]ProxyGoroutine, 0)
+		proxyGoroutineListFreeIDs = make([]int64, 0)
+		currentUnavailable = make([]ProxyGoroutine, 0)
+		currentDifferentCountry = make([]ProxyGoroutine, 0)
+		currentOK = make([]ProxyGoroutine, 0)
+		go manipulatorGoProxiesChecks()
+	} else {
+		log.Info("Peers checks disabled")
+	}
+
+	// Start bot
+	u := tgbotapi.NewUpdate(0)
+	u.Timeout = 60
+
+	updates := bot.GetUpdatesChan(u)
+
+	for update := range updates {
+		if update.CallbackQuery != nil {
+			callbackData := update.CallbackQuery.Data
+
+			if strings.HasPrefix(callbackData, "remove_proxy_") {
+				proxy := callbackData[len("remove_proxy_"):]
+				err := removeProxyFromFile(proxyFiles[0].File, proxy)
+				if err != nil {
+					log.Error("Failed to remove proxy from file", err)
+				}
+				msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, fmt.Sprintf("Прокси %s удален", proxy))
+				if _, err := bot.Send(msg); err != nil {
+					log.Error("Failed to send message", err)
+				}
+			}
+
+			if strings.HasPrefix(callbackData, "quarantine_proxy_") {
+				proxy := callbackData[len("quarantine_proxy_"):]
+				err := setquarantineProxyFromFile(proxyFiles[0].File, proxy)
+				if err != nil {
+					log.Error("Failed to set proxy in quarantine", err)
+				}
+				msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, fmt.Sprintf("Прокси %s перемещён в карантин", proxy))
+				if _, err := bot.Send(msg); err != nil {
+					log.Error("Failed to send message", err)
+				}
+			}
+		} // <-- Закрываем блок if update.CallbackQuery != nil
+
+		// Продолжение обработки update.Message должно быть вне блока CallbackQuery
+		if update.Message != nil {
+			// ... (здесь будет продолжение обработки текстовых сообщений)
+		}
+
+		if update.Message != nil {
+			if len(tgAcl) > 0 && !checkListContainsInt64(tgAcl, update.Message.From.ID) {
+				log.Info(fmt.Sprintf("UserId %d tryed to use bot, but he's not in whitelist", update.Message.From.ID))
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "You dont have permissions to use this bot.")
+
+				_, err = bot.Send(msg)
+				if err != nil {
+					log.Println(err)
+				}
+			} else {
+
+				cmd := update.Message.Text
+				parts := strings.Split(cmd, " ")
+				// fmt.Print(parts, len(parts))
+				if len(parts) == 1 && update.Message.ReplyToMessage == nil {
+					switch strings.ToLower(parts[0]) {
+					case "/start":
+						keyboard := tgbotapi.NewReplyKeyboard(
+							tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton("set"),
+								tgbotapi.NewKeyboardButton("add"),
+								tgbotapi.NewKeyboardButton("remove"),
+								tgbotapi.NewKeyboardButton("quarantine"),
+								tgbotapi.NewKeyboardButton("list"),
+							))
+						keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+							tgbotapi.NewKeyboardButton(fmt.Sprintf("logs")),
+							tgbotapi.NewKeyboardButton(fmt.Sprintf("check")),
+						))
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выбор действия")
+						msg.ReplyMarkup = keyboard
+
+						if _, err := bot.Send(msg); err != nil {
+							log.Error("Failed to send message", err)
+						}
+
+					case "list":
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("list", proxyFiles, []string{"list unavailable", "list wrong-country", "list all"})
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					case "add":
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("add", proxyFiles, nil)
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					case "set":
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("set", proxyFiles, nil)
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+						// setProxy(bot, update.Message.Chat.ID, configs)
+					case "remove":
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("remove", proxyFiles, nil)
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+
+					case "quarantine":
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("quarantine", proxyFiles, nil)
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					case "logs":
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите какие логи хотите загрузить")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("logs", nil, []string{
+							"logs unsuccessful",
+						})
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					case "check":
+
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну прокси которой хотите проверить или выберите manual для проверки кастомного списка")
+						msg.ReplyMarkup = proxiesListTgButtonWPrefix("check", proxyFiles, []string{"check manual"})
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+
+					default:
+						msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Unknown command")
+						if _, err := bot.Send(msg); err != nil {
+							log.Error("Failed to send message", err)
+						}
+					}
+				}
+
+				if len(parts) == 2 && update.Message.ReplyToMessage == nil {
+					switch strings.ToLower(parts[0]) {
+					case "remove":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите страну")
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "quarantine":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+
+									if err != nil {
+										log.Println(err)
+									}
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выберите прокси")
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "logs":
+						if parts[1] == "unsuccessful" {
+							msg := tgbotapi.NewDocument(update.Message.Chat.ID, tgbotapi.FilePath(fmt.Sprintf("%s/unsuccessful", logsDir)))
+							_, err = bot.Send(msg)
+							if err != nil {
+								log.Println(err)
+							}
+						}
+					case "check":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									for _, p := range proxies {
+										for _, c := range proxyChecksDefault {
+
+											currentCheck := proxyCheck(p, c.Url, c.GetCountry)
+											messageText := fmt.Sprintf("Proxy check\n===\nProxy: %s\nCountry: %s\nCheck URL: %s", p, file.Country, c.Url)
+											if currentCheck.Available {
+												if c.GetCountry {
+													messageText = fmt.Sprintf("%s\nCountry Response: %s", messageText, currentCheck.Country)
+												}
+												body := ""
+												if len(currentCheck.Body) > 500 {
+													body = currentCheck.Body[:500] + "..."
+												} else {
+													body = currentCheck.Body
+												}
+												messageText = fmt.Sprintf("%s\nBody response:\n%s", messageText, body)
+											} else {
+												messageText = fmt.Sprintf("%s\nStatus: unsuccessful", messageText)
+											}
+
+											msg := tgbotapi.NewMessage(update.Message.Chat.ID, messageText)
+											if _, err := bot.Send(msg); err != nil {
+												log.Error("Failed to send message", err)
+											}
+										}
+										msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Proxy: %s\nCountry: %s\nCheck finished", p, file.Country))
+										if _, err := bot.Send(msg); err != nil {
+											log.Error("Failed to send message", err)
+										}
+
+									}
+
+								}
+							}
+						} else if parts[1] == "manual" {
+							keyboard := tgbotapi.NewReplyKeyboard(
+								tgbotapi.NewKeyboardButtonRow(
+									tgbotapi.NewKeyboardButton("[check] [manual] [1]addr:port:login:pass"),
+								))
+							keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton("[check] [manual] [2]proto://addr:port:login:pass"),
+							))
+							keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton("[check] [manual] [3]login:pass@addr:port"),
+							))
+							keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton("[check] [manual] [4]proto://login:pass@addr:port"),
+							))
+							keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton("To begin"),
+							))
+							msg := tgbotapi.NewMessage(
+								update.Message.Chat.ID,
+								fmt.Sprintf("Choose proxy format"))
+							msg.ReplyMarkup = keyboard
+							_, err = bot.Send(msg)
+							if err != nil {
+								log.Println()
+							}
+						} else {
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Unknown command")
+							if _, err := bot.Send(msg); err != nil {
+								log.Error("Failed to send message", err)
+							}
+						}
+					case "add":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									if err != nil {
+										log.Println(err)
+									}
+
+									keyboard := tgbotapi.NewReplyKeyboard(
+										tgbotapi.NewKeyboardButtonRow(
+											tgbotapi.NewKeyboardButton(fmt.Sprintf("[add] [%s] [1]addr:port:login:pass", file.Country)),
+										))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[add] [%s] [2]proto://addr:port:login:pass", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[add] [%s] [3]login:pass@addr:port", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[add] [%s] [4]proto://login:pass@addr:port", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton("To begin"),
+									))
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Choose proxy format")
+									msg.ReplyMarkup = keyboard
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "list":
+						if parts[1] == "unavailable" {
+							totalList := "🔴 - Quarantine, 🟡 - Autoquarantine\n\n"
+
+							for _, file := range proxyFiles {
+								filePath := file.File
+								country := file.Country
+
+								// Читаем содержимое файла
+								data, err := os.ReadFile(filePath)
+								if err != nil {
+									log.Printf("Ошибка чтения файла %s: %v", filePath, err)
+									continue
+								}
+
+								lines := strings.Split(string(data), "\n")
+								totalList = fmt.Sprintf("%sCOUNTRY: %s\n", totalList, country)
+
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if line == "" {
+										continue
+									}
+
+									if strings.HasPrefix(line, "quarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "quarantine "))
+										totalList = fmt.Sprintf("%s🔴 %s\n", totalList, proxy)
+
+									} else if strings.HasPrefix(line, "autoquarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
+										totalList = fmt.Sprintf("%s🟡 %s\n", totalList, proxy)
+									}
+								}
+
+								totalList += "\n"
+							}
+
+							messages := splitMessageByNewline(totalList)
+							for _, tgMsg := range messages {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, tgMsg)
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+							}
+
+							// unavailableList := "Current unavailable proxies"
+							// for _, proxy := range currentUnavailable {
+							// 	unavailableList = fmt.Sprintf("%s\n\nCountry:%s\nProxy:%s", unavailableList, proxy.Country, proxy.Url)
+							// }
+
+							// msg := tgbotapi.NewMessage(update.Message.Chat.ID, unavailableList)
+
+							// _, err = bot.Send(msg)
+							// if err != nil {
+							// 	log.Println(err)
+							// }
+						} else if parts[1] == "wrong-country" {
+							wrongCountryList := "Current proxies with wrong country"
+							for _, proxy := range currentDifferentCountry {
+								wrongCountryList = fmt.Sprintf("%s\n\nCountry:%s\nProxy:%s", wrongCountryList, proxy.Country, proxy.Url)
+							}
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, wrongCountryList)
+
+							_, err = bot.Send(msg)
+							if err != nil {
+								log.Println(err)
+							}
+						} else if parts[1] == "all" {
+							totalList := "🟢 - OK , 🔴 - Quarantine, 🟡 - Autoquarantine\n\n"
+
+							for _, file := range proxyFiles {
+								filePath := file.File
+								country := file.Country
+
+								// Читаем содержимое файла
+								data, err := os.ReadFile(filePath)
+								if err != nil {
+									log.Printf("Ошибка чтения файла %s: %v", filePath, err)
+									continue
+								}
+
+								lines := strings.Split(string(data), "\n")
+								totalList = fmt.Sprintf("%sCOUNTRY: %s\n", totalList, country)
+
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if line == "" {
+										continue
+									}
+
+									if strings.HasPrefix(line, "peer ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
+										totalList = fmt.Sprintf("%s🟢 %s\n", totalList, proxy)
+
+									} else if strings.HasPrefix(line, "quarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "quarantine "))
+										totalList = fmt.Sprintf("%s🔴 %s\n", totalList, proxy)
+
+									} else if strings.HasPrefix(line, "autoquarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
+										totalList = fmt.Sprintf("%s🟡 %s\n", totalList, proxy)
+									}
+								}
+
+								totalList += "\n"
+							}
+
+							messages := splitMessageByNewline(totalList)
+							for _, tgMsg := range messages {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, tgMsg)
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+							}
+
+							// else if parts[1] == "all" {
+							// 	totalList := "🟢 - OK, 🟡 - Different Country, 🔴 - Unavailable"
+
+							// 	for _, file := range proxyFiles {
+							// 		totalList = fmt.Sprintf("%s\n\nCOUNTRY: %s\n", totalList, file.Country)
+							// 		for _, proxy := range currentOK {
+							// 			if proxy.Country == file.Country {
+							// 				totalList = fmt.Sprintf("%s\n🟢 %s", totalList, proxy.Url)
+							// 			}
+							// 		}
+							// 		for _, proxy := range currentDifferentCountry {
+							// 			if proxy.Country == file.Country {
+							// 				totalList = fmt.Sprintf("%s\n🟡 %s", totalList, proxy.Url)
+							// 			}
+							// 		}
+							// 		for _, proxy := range currentUnavailable {
+							// 			if proxy.Country == file.Country {
+							// 				totalList = fmt.Sprintf("%s\n🔴 %s", totalList, proxy.Url)
+							// 			}
+							// 		}
+							// 	}
+							// 	messages := splitMessageByNewline(totalList)
+							// 	for _, tgMsg := range messages {
+							// 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, tgMsg)
+							// 		_, err = bot.Send(msg)
+							// 		if err != nil {
+							// 			log.Println(err)
+							// 		}
+							// 	}
+						} else {
+							if checkListContainsString(countriesList, parts[1]) == true {
+
+								totalList := "🟢 - OK , 🔴 - Quarantine, 🟡 - Autoquarantine\n\n"
+
+								var targetFile *ConfigProxyFiles = nil
+
+								// Ищем файл с нужной страной
+								for _, file := range proxyFiles {
+									if file.Country == parts[1] {
+										targetFile = &file
+										break
+									}
+								}
+
+								if targetFile == nil {
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Файл для указанной страны не найден")
+									bot.Send(msg)
+									return
+								}
+
+								filePath := targetFile.File
+								country := targetFile.Country
+
+								// Читаем содержимое файла
+								data, err := os.ReadFile(filePath)
+								if err != nil {
+									log.Printf("Ошибка чтения файла %s: %v", filePath, err)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("❌ Ошибка чтения файла для страны %s", country))
+									bot.Send(msg)
+									return
+								}
+
+								lines := strings.Split(string(data), "\n")
+								totalList = fmt.Sprintf("%sCOUNTRY: %s\n", totalList, country)
+
+								for _, line := range lines {
+									line = strings.TrimSpace(line)
+									if line == "" {
+										continue
+									}
+
+									if strings.HasPrefix(line, "quarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "quarantine "))
+										totalList = fmt.Sprintf("%s🔴 %s\n", totalList, proxy)
+
+									} else if strings.HasPrefix(line, "autoquarantine ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
+										totalList = fmt.Sprintf("%s🟡 %s\n", totalList, proxy)
+
+									} else if strings.HasPrefix(line, "peer ") {
+										proxy := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
+										totalList = fmt.Sprintf("%s🟢 %s\n", totalList, proxy)
+									}
+								}
+
+								messages := splitMessageByNewline(totalList)
+								for _, tgMsg := range messages {
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, tgMsg)
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+
+					case "set":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									if err != nil {
+										log.Println(err)
+									}
+
+									keyboard := tgbotapi.NewReplyKeyboard(
+										tgbotapi.NewKeyboardButtonRow(
+											tgbotapi.NewKeyboardButton(fmt.Sprintf("[set] [%s] [1]addr:port:login:pass", file.Country)),
+										))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[set] [%s] [2]proto://addr:port:login:pass", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[set] [%s] [3]login:pass@addr:port", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton(fmt.Sprintf("[set] [%s] [4]proto://login:pass@addr:port", file.Country)),
+									))
+									keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+										tgbotapi.NewKeyboardButton("To begin"),
+									))
+
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Choose proxy format")
+									msg.ReplyMarkup = keyboard
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "to":
+						if parts[1] == "begin" {
+
+							keyboard := tgbotapi.NewReplyKeyboard(
+								tgbotapi.NewKeyboardButtonRow(
+									tgbotapi.NewKeyboardButton("set"),
+									tgbotapi.NewKeyboardButton("add"),
+									tgbotapi.NewKeyboardButton("remove"),
+									tgbotapi.NewKeyboardButton("quarantine"),
+									tgbotapi.NewKeyboardButton("list"),
+								))
+							keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+								tgbotapi.NewKeyboardButton(fmt.Sprintf("logs")),
+								tgbotapi.NewKeyboardButton(fmt.Sprintf("check")),
+							))
+
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Выбор действия")
+							msg.ReplyMarkup = keyboard
+
+							if _, err := bot.Send(msg); err != nil {
+								log.Error("Failed to send message", err)
+							}
+						} else {
+
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, "Unknown command")
+							if _, err := bot.Send(msg); err != nil {
+								log.Error("Failed to send message", err)
+							}
+						}
+
+					}
+				}
+				if len(parts) == 3 && update.Message.ReplyToMessage == nil {
+
+					switch strings.ToLower(parts[0]) {
+					case "remove":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									if checkListContainsString(proxies, parts[2]) == true {
+										deleteProxyFromFile(file.File, parts[2])
+									}
+									proxies, err = getProxiesFromFile(file.File)
+									buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted", file.Country, parts[2]))
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+
+					case "toquarantine":
+
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									if checkListContainsString(proxies, parts[2]) == true {
+										setquarantineProxyFromFile(file.File, parts[2])
+									}
+									proxies, err = getProxiesFromFile(file.File)
+									buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: In Quarantine", file.Country, parts[2]))
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+						// if len(parts) == 3 && update.Message.ReplyToMessage == nil {
+						// 	fmt.Printf("%+v\n", parts)
+						// 	switch strings.ToLower(parts[0]) {
+						// 	case "remove":
+						// 		if checkListContainsString(countriesList, parts[1]) {
+						// 			for _, file := range proxyFiles {
+						// 				if file.Country == parts[1] {
+						// 					proxies, err := getProxiesFromFile(file.File)
+						// 					if err != nil {
+						// 						log.Println(err)
+						// 					}
+
+						// 					if checkListContainsString(proxies, parts[2]) {
+						// 						err := deleteProxyFromFile(file.File, parts[2])
+						// 						if err != nil {
+						// 							log.Println(err)
+						// 						}
+						// 					}
+
+						// 					proxies, err = getProxiesFromFile(file.File)
+						// 					if err != nil {
+						// 						log.Println(err)
+						// 					}
+
+						// 					keyboard := buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+						// 					msg := tgbotapi.NewMessage(
+						// 						update.Message.Chat.ID,
+						// 						fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted", file.Country, parts[2]),
+						// 					)
+						// 					msg.ReplyMarkup = keyboard
+
+						// 					_, err = bot.Send(msg)
+						// 					if err != nil {
+						// 						log.Println("Failed to send message:", err)
+						// 					}
+						// 					return
+						// 				}
+						// 			}
+						// 			// Страна не найдена
+						// 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Страна не найдена")
+						// 			bot.Send(msg)
+						// 		}
+
+						// 	case "quarantine":
+						// 		if checkListContainsString(countriesList, parts[1]) {
+						// 			for _, file := range proxyFiles {
+						// 				if file.Country == parts[1] {
+						// 					proxies, err := getProxiesFromFile(file.File)
+						// 					if err != nil {
+						// 						log.Println(err)
+						// 					}
+
+						// 					if checkListContainsString(proxies, parts[2]) {
+						// 						err := setquarantineProxyFromFile(file.File, parts[2])
+						// 						if err != nil {
+						// 							log.Println(err)
+						// 						}
+						// 					}
+
+						// 					proxies, err = getProxiesFromFile(file.File)
+						// 					if err != nil {
+						// 						log.Println(err)
+						// 					}
+
+						// 					keyboard := buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+						// 					msg := tgbotapi.NewMessage(
+						// 						update.Message.Chat.ID,
+						// 						fmt.Sprintf("Country: %s\nProxy: %s\nState: In Quarantine", file.Country, parts[2]),
+						// 					)
+						// 					msg.ReplyMarkup = keyboard
+
+						// 					_, err = bot.Send(msg)
+						// 					if err != nil {
+						// 						log.Println("Failed to send message:", err)
+						// 					}
+						// 					return
+						// 				}
+						// 			}
+						// 			// Страна не найдена
+						// 			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Страна не найдена")
+						// 			bot.Send(msg)
+						// 		}
+
+					case "[add]":
+						re := regexp.MustCompile(`\[(.*?)\]`)
+						matches := re.FindAllStringSubmatch(update.Message.Text, -1)
+						if len(matches) >= 3 {
+							fmt.Printf("Третий попавшийся regex: %s\n", matches[2][1])
+						} else {
+							fmt.Println("Нет трех попавшихся regex")
+						}
+						if checkListContainsString(countriesList, matches[1][1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == matches[1][1] {
+									if err != nil {
+										log.Println(err)
+									}
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Reply to this message to ADD proxies for %s.\nEvery New proxy should be from new line.\nActionUID:add-%s-%s", file.Country, file.Country, matches[2][1]))
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "[check]":
+						re := regexp.MustCompile(`\[(.*?)\]`)
+						matches := re.FindAllStringSubmatch(update.Message.Text, -1)
+						if len(matches) >= 3 {
+							fmt.Printf("Третий попавшийся regex: %s\n", matches[2][1])
+						} else {
+							fmt.Println("Нет трех попавшихся regex")
+						}
+						msg := tgbotapi.NewMessage(
+							update.Message.Chat.ID,
+							fmt.Sprintf("Reply to this message to CHECK proxies.\nEvery New proxy should be from new line.\nActionUID:check-%s", matches[2][1]))
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					case "[set]":
+						re := regexp.MustCompile(`\[(.*?)\]`)
+						matches := re.FindAllStringSubmatch(update.Message.Text, -1)
+						if len(matches) >= 3 {
+							fmt.Printf("Третий попавшийся regex: %s\n", matches[2][1])
+						} else {
+							fmt.Println("Нет трех попавшихся regex")
+						}
+						if checkListContainsString(countriesList, matches[1][1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == matches[1][1] {
+									if err != nil {
+										log.Println(err)
+									}
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Reply to this message to SET proxies for %s.\nEvery New proxy should be from new line.\nActionUID:set-%s-%s", file.Country, file.Country, matches[2][1]))
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					}
+				}
+
+				if len(parts) == 4 && update.Message.ReplyToMessage == nil {
+
+					switch strings.ToLower(parts[0]) {
+					case "remove":
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									var cleanproxies []string
+
+									for _, line := range proxies {
+										line = strings.TrimSpace(line) // Убираем лишние пробелы по краям
+										if line == "" {
+											continue // Пропускаем пустые строки
+										}
+
+										if strings.HasPrefix(line, "QUARANTINE ") {
+											// Убираем префикс "QUARANTINE "
+											cleanLine := strings.TrimSpace(strings.TrimPrefix(line, "QUARANTINE "))
+											cleanproxies = append(cleanproxies, cleanLine)
+										}
+									}
+
+									if checkListContainsString(cleanproxies, parts[3]) == true {
+										deleteQuarantineProxyFromFile(file.File, parts[3])
+									}
+									proxies, err = getProxiesFromFile(file.File)
+									buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted", file.Country, parts[3]))
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("remove %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+
+					case "toquarantine":
+
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									var cleanproxies []string
+
+									for _, line := range proxies {
+										line = strings.TrimSpace(line) // Убираем лишние пробелы по краям
+										if line == "" {
+											continue // Пропускаем пустые строки
+										}
+
+										if strings.HasPrefix(line, "AUTOQUARANTINE ") {
+											// Убираем префикс "autoquarantine "
+											cleanLine := strings.TrimSpace(strings.TrimPrefix(line, "AUTOQUARANTINE "))
+											cleanproxies = append(cleanproxies, cleanLine)
+										}
+									}
+									fmt.Print(cleanproxies, parts[3], file.File)
+									if checkListContainsString(cleanproxies, parts[3]) == true {
+										setquarantineProxyFromFile(file.File, parts[3])
+									}
+									proxies, err = getProxiesFromFile(file.File)
+									buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: In Quarantine", file.Country, parts[3]))
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					case "dequarantine":
+
+						if checkListContainsString(countriesList, parts[1]) == true {
+							for _, file := range proxyFiles {
+								if file.Country == parts[1] {
+									proxies, err := getProxiesFromFile(file.File)
+									if err != nil {
+										log.Println(err)
+									}
+									var cleanproxies []string
+
+									for _, line := range proxies {
+										line = strings.TrimSpace(line) // Убираем лишние пробелы по краям
+										if line == "" {
+											continue // Пропускаем пустые строки
+										}
+
+										if strings.HasPrefix(line, "QUARANTINE ") {
+											// Убираем префикс "QUARANTINE "
+											cleanLine := strings.TrimSpace(strings.TrimPrefix(line, "QUARANTINE "))
+											cleanproxies = append(cleanproxies, cleanLine)
+										}
+									}
+									if checkListContainsString(cleanproxies, parts[3]) == true {
+										outquarantineProxyFromFile(file.File, parts[3])
+									}
+									proxies, err = getProxiesFromFile(file.File)
+									buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Out of quarantine", file.Country, parts[3]))
+									msg.ReplyMarkup = buttonsPrepareFromList(fmt.Sprintf("quarantine %s", file.Country), proxies)
+
+									_, err = bot.Send(msg)
+									if err != nil {
+										log.Println(err)
+									}
+								}
+							}
+						}
+					}
+				}
+				if update.Message.ReplyToMessage != nil {
+					repliedMessage := update.Message.ReplyToMessage.Text
+					actionUIDLine := strings.Split(repliedMessage, "ActionUID:")
+					actionUID := ""
+					if len(actionUIDLine) > 1 {
+						actionUID = actionUIDLine[1]
+					}
+					fmt.Printf(actionUID)
+					parts := strings.SplitN(actionUID, "-", 3)
+					action := parts[0]
+					format := ""
+					country := ""
+					if action == "check" {
+						format = parts[1]
+					} else {
+						country = parts[1]
+						format = parts[2]
+					}
+					proxyFile := ""
+
+					for _, file := range proxyFiles {
+						if file.Country == country {
+							proxyFile = file.File
+						}
+					}
+					if action == "check" {
+						for _, line := range strings.Split(strings.TrimSuffix(update.Message.Text, "\n"), "\n") {
+							_, err := url.Parse(line)
+							if err != nil {
+								log.Println(err)
+							}
+							if line != "" {
+								if format == "1" {
+									proxyPart := strings.Split(line, ":") //addr:port:login:pass
+									if len(proxyPart) < 4 {
+										msg := tgbotapi.NewMessage(
+											update.Message.Chat.ID,
+											fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not Checked\nReason: Incorrect Proxy format", country, line))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+
+									proxyAddr := proxyPart[0]
+									proxyPort := proxyPart[1]
+									proxyLogin := proxyPart[2]
+									proxyPass := proxyPart[3]
+
+									line = fmt.Sprintf("socks5h://%s:%s@%s:%s", proxyLogin, proxyPass, proxyAddr, proxyPort)
+								} else if format == "2" {
+									sepProxy := strings.SplitN(line, "://", 2)
+									proxyPart := strings.Split(sepProxy[1], ":") //addr:port:login:pass
+									if len(proxyPart) < 4 {
+										msg := tgbotapi.NewMessage(
+											update.Message.Chat.ID,
+											fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not checked\nReason: Incorrect Proxy format", country, line))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+									proxyAddr := proxyPart[0]
+									proxyPort := proxyPart[1]
+									proxyLogin := proxyPart[2]
+									proxyPass := proxyPart[3]
+									line = fmt.Sprintf("%s://%s:%s@%s:%s", sepProxy[0], proxyLogin, proxyPass, proxyAddr, proxyPort)
+								} else if format == "3" {
+									line = fmt.Sprintf("socks5h://%s", line)
+								}
+
+								for _, c := range proxyChecksDefault {
+									messageText := ""
+									currentCheck := ProxyCheckResponse{Available: false, Country: "", Error: nil, Body: ""}
+
+									currentCheck = proxyCheck(line, c.Url, c.GetCountry)
+									messageText = fmt.Sprintf("Proxy check\n===\nProxy: %s\nCheck URL: %s", line, c.Url)
+									if currentCheck.Available {
+										if c.GetCountry {
+											messageText = fmt.Sprintf("%s\nCountry Response: %s", messageText, currentCheck.Country)
+										}
+										body := ""
+										if len(currentCheck.Body) > 500 {
+											body = currentCheck.Body[:500] + "..."
+										} else {
+											body = currentCheck.Body
+										}
+
+										messageText = fmt.Sprintf("%s\nBody response:\n%s", messageText, body)
+									} else {
+										messageText = fmt.Sprintf("%s\nStatus: unsuccessful", messageText)
+									}
+
+									msg := tgbotapi.NewMessage(update.Message.Chat.ID, messageText)
+									if _, err := bot.Send(msg); err != nil {
+										log.Error("Failed to send message", err)
+									}
+								}
+
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Proxy: %s\nCheck finished", line))
+								if _, err := bot.Send(msg); err != nil {
+									log.Error("Failed to send message", err)
+								}
+							}
+
+						}
+					}
+					if action == "add" {
+						if checkListContainsString(countriesList, country) == true {
+							for _, line := range strings.Split(strings.TrimSuffix(update.Message.Text, "\n"), "\n") {
+								_, err := url.Parse(line)
+								if err != nil {
+									log.Println(err)
+								}
+								if format == "1" {
+									proxyPart := strings.Split(line, ":") //addr:port:login:pass
+									if len(proxyPart) < 4 {
+										msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not Added\nReason: Incorrect Proxy format", country, line))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+
+									proxyAddr := proxyPart[0]
+									proxyPort := proxyPart[1]
+									proxyLogin := proxyPart[2]
+									proxyPass := proxyPart[3]
+
+									line = fmt.Sprintf("socks5h://%s:%s@%s:%s", proxyLogin, proxyPass, proxyAddr, proxyPort)
+								} else if format == "2" {
+									sepProxy := strings.SplitN(line, "://", 2)
+									proxyPart := strings.Split(sepProxy[1], ":") //addr:port:login:pass
+									if len(proxyPart) < 4 {
+										msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not Added\nReason: Incorrect Proxy format", country, line))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+									proxyAddr := proxyPart[0]
+									proxyPort := proxyPart[1]
+									proxyLogin := proxyPart[2]
+									proxyPass := proxyPart[3]
+									line = fmt.Sprintf("%s://%s:%s@%s:%s", sepProxy[0], proxyLogin, proxyPass, proxyAddr, proxyPort)
+								} else if format == "3" {
+									line = fmt.Sprintf("socks5h://%s", line)
+								}
+
+								if onAddChecksEnable {
+									countryChecked, err := getCountry(line)
+									if err != nil {
+										msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not Added\nReason: Proxy check failed: No answer from site via proxy", countryChecked, line))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+									if country != countryChecked {
+										msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: [FAIL] Not Added\nReason: Proxy check failed: Different Country: %s (Must be %s)", country, line, countryChecked, country))
+										_, err = bot.Send(msg)
+										if err != nil {
+											log.Println(err)
+										}
+										continue
+									}
+								}
+
+								// вносим строку в файл
+								err = addProxyToFile(proxyFile, line)
+								if err != nil {
+									log.Println(err)
+								}
+
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Added", country, line))
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+							}
+						}
+					}
+					if action == "set" {
+						if checkListContainsString(countriesList, country) == true {
+							var newLines []string
+							for _, line := range strings.Split(strings.TrimSuffix(update.Message.Text, "\n"), "\n") {
+								newLines = append(newLines, line)
+								_, err := url.Parse(line)
+								if err != nil {
+									log.Println(err)
+								}
+							}
+
+							err, oldLines := setProxyInFile(proxyFile, newLines, format, country)
+							if err != nil {
+								log.Println(err)
+							}
+							for _, line := range oldLines {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted", country, line))
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+
+							}
+							for _, line := range newLines {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Added", country, line))
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+
+							}
+						}
+					}
+					if action == "check" {
+						if checkListContainsString(countriesList, country) == true {
+							var newLines []string
+							for _, line := range strings.Split(strings.TrimSuffix(update.Message.Text, "\n"), "\n") {
+								newLines = append(newLines, line)
+								_, err := url.Parse(line)
+								if err != nil {
+									log.Println(err)
+								}
+							}
+
+							err, oldLines := setProxyInFile(proxyFile, newLines, format, country)
+							if err != nil {
+								log.Println(err)
+							}
+							for _, line := range oldLines {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted", country, line))
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+
+							}
+							for _, line := range newLines {
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Added", country, line))
+								_, err = bot.Send(msg)
+								if err != nil {
+									log.Println(err)
+								}
+
+							}
+						}
+					}
+				}
+			}
+		} else if update.CallbackQuery != nil {
+			callback := tgbotapi.NewCallback(update.CallbackQuery.ID, update.CallbackQuery.Data)
+			if _, err := bot.Request(callback); err != nil {
+				panic(err)
+			}
+
+			parts := strings.Split(update.CallbackQuery.Message.Text, "\n")
+
+			partsProxy := strings.Split(parts[1], "Proxy: ")
+			partsCounty := strings.Split(parts[2], "Country: ")
+			fmt.Printf("proxy - %s\n", partsProxy[1])
+			fmt.Printf("country - %s\n", partsCounty[1])
+
+			if checkListContainsString(countriesList, partsCounty[1]) == true {
+				for _, file := range proxyFiles {
+					if file.Country == partsCounty[1] {
+						proxies, err := getProxiesFromFile(file.File)
+						if err != nil {
+							log.Println(err)
+						}
+						if checkListContainsString(proxies, partsProxy[1]) == true {
+							deleteProxyFromFile(file.File, partsProxy[1])
+						}
+						proxies, err = getProxiesFromFile(file.File)
+						msg := tgbotapi.NewMessage(update.CallbackQuery.Message.Chat.ID, fmt.Sprintf("Country: %s\nProxy: %s\nState: Deleted\nMade by User: %s", file.Country, partsProxy[1], update.CallbackQuery.From.UserName))
+
+						_, err = bot.Send(msg)
+						if err != nil {
+							log.Println(err)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func manipulatorGoProxiesChecks() {
+	log.Debug("manipulatorGoProxiesChecks started")
+	log.Tracef("ProxyFiles: %s", proxyFiles)
+	for {
+		log.Tracef("manipulatorGoProxiesChecks new cycle")
+		proxiesChecksGoToDelete := make([]ProxyGoroutine, len(proxyGoroutineList))
+		copy(proxiesChecksGoToDelete, proxyGoroutineList)
+		log.Tracef("proxiesChecksGoToDelete before: %v", proxiesChecksGoToDelete)
+		for _, singleProxyFile := range proxyFiles {
+
+			proxies, err := readProxies(singleProxyFile.File)
+			if err != nil {
+				log.Error("Failed to read proxies", err)
+				continue
+			}
+			log.Tracef("Proxy File for country %s readed succesfully (%s)", singleProxyFile.Country, singleProxyFile.File)
+			for _, proxy := range proxies {
+				exists := searchProxyInProxyGoroutinesList(singleProxyFile.Country, proxy)
+				if !exists {
+					log.Infof("Added to proxyGoroutineList Country: %s Url: %s", singleProxyFile.Country, proxy)
+					goRoutine := ProxyGoroutine{
+						Country:  singleProxyFile.Country,
+						Url:      proxy,
+						StopChan: make(chan struct{}),
+					}
+					proxyGoroutineList = append(proxyGoroutineList, goRoutine)
+					log.Debugf("List of proxies right now: %v", proxyGoroutineList)
+
+					go func(goRoutine ProxyGoroutine) {
+						var unsuccesfulChecksCount int64
+						var differentCountryCount int64
+						unsuccesfulChecksCount = 0
+						differentCountryCount = 0
+						for {
+							select {
+							case <-goRoutine.StopChan:
+								log.Infof("Closed Checking Goroutine for proxy: %s Url: %s", goRoutine.Country, goRoutine.Url)
+								return
+							default:
+								// вычисляем действия, описанные вами
+								log.Tracef("Cycle check started Country: %s Proxy: %s", goRoutine.Country, goRoutine.Url)
+								checkSuccessful := false
+								countrySame := true
+								countryResponse := ""
+								for i, c := range proxyChecksDefault {
+									check := proxyCheck(goRoutine.Url, c.Url, c.GetCountry)
+									if check.Error != nil {
+										log.Debugf("[%d] check failed (%s). Err: %s Country: %s Proxy %s", i, c.Url, check.Error, goRoutine.Country, goRoutine.Url)
+										logFileUnsuccess.Infof("[%d] check failed! (%s) (Checked via %s). Country: %s Proxy %s",
+											i, check.Country,
+											c.Url,
+											goRoutine.Country,
+											goRoutine.Url)
+									}
+									if check.Country == "" && check.Error != nil {
+										log.Tracef("[%d] Country not checked (%s). Country: %s Proxy %s", i, c.Url, goRoutine.Country, goRoutine.Url)
+									} else if check.Country == "!" && check.Error != nil {
+										log.Tracef("[%d] Country check error (!) (%s). Country: %s Proxy %s", i, c.Url, goRoutine.Country, goRoutine.Url)
+									} else if check.Country != goRoutine.Country && check.Error != nil {
+										log.Tracef("[%d] Country check is different! (%s) (Checked via %s). Country: %s Proxy %s", i, check.Country, c.Url, goRoutine.Country, goRoutine.Url)
+										countrySame = false
+										countryResponse = check.Country
+										logFileUnsuccess.Infof("[%d] Country check is different! (%s) (Checked via %s). Country: %s Proxy %s",
+											i, check.Country,
+											c.Url,
+											goRoutine.Country,
+											goRoutine.Url)
+									}
+									if check.Available == true {
+										checkSuccessful = true
+										log.Tracef("[%d] check succesful (%s). No more checks needed. Country: %s Proxy %s", i, c.Url, goRoutine.Country, goRoutine.Url)
+										triggerToAdd := true
+										for _, OKGoRoutine := range currentOK {
+											if goRoutine.Url == OKGoRoutine.Url && goRoutine.Country == OKGoRoutine.Country {
+												triggerToAdd = false
+											}
+										}
+										if triggerToAdd {
+											currentOK = append(currentOK, goRoutine)
+										}
+										break
+									}
+								}
+
+								if !countrySame {
+									differentCountryCount++
+								} else {
+									if differentCountryCount >= 3 {
+										msg := tgbotapi.NewMessage(
+											tgChannelID,
+											fmt.Sprintf("[COUNTRY FIXED] Proxy shows again correct country. Number of tries with incorrect country: %d.\nProxy: %s\nCountry: %s",
+												differentCountryCount, goRoutine.Url, goRoutine.Country))
+										if _, err := bot.Send(msg); err != nil {
+											log.Error("Failed to send message", err)
+										}
+										for i, wrongGoRoutine := range currentDifferentCountry {
+											if goRoutine.Url == wrongGoRoutine.Url && goRoutine.Country == wrongGoRoutine.Country {
+												currentDifferentCountry = append(currentDifferentCountry[:i], currentDifferentCountry[i+1:]...)
+											}
+										}
+									}
+									differentCountryCount = 0
+								}
+
+								if !checkSuccessful {
+									unsuccesfulChecksCount++
+								} else {
+									if unsuccesfulChecksCount >= 3 {
+										filePath, found := findFileByCountry(goRoutine.Country)
+										if !found {
+											log.Warnf("Country %s not found in proxyFiles", goRoutine.Country)
+											continue
+										}
+
+										err := outautoquarantineProxyFromFile(filePath, goRoutine.Url)
+										if err != nil {
+											log.Error("Failed to move proxy from quarantine", err)
+										}
+
+										msg := tgbotapi.NewMessage(
+											tgChannelID,
+											fmt.Sprintf("[ALIVE] Proxy became alive. Number of unsuccessful tries: %d.\nProxy: %s\nCountry: %s",
+												unsuccesfulChecksCount, goRoutine.Url, goRoutine.Country))
+										if _, err := bot.Send(msg); err != nil {
+											log.Error("Failed to send message", err)
+										}
+										for i, unavailableGoRoutine := range currentUnavailable {
+											if goRoutine.Url == unavailableGoRoutine.Url && goRoutine.Country == unavailableGoRoutine.Country {
+												currentUnavailable = append(currentUnavailable[:i], currentUnavailable[i+1:]...)
+											}
+										}
+									}
+
+									unsuccesfulChecksCount = 0
+								}
+
+								if unsuccesfulChecksCount == 1 || differentCountryCount == 1 {
+									time.Sleep(1 * time.Minute) // подождать 1 минуту после первой попытки
+								} else if unsuccesfulChecksCount == 2 || differentCountryCount == 1 {
+									time.Sleep(2 * time.Minute) // подождать 2 минуты после второй попытки
+								} else if unsuccesfulChecksCount == 3 {
+
+									filePath, found := findFileByCountry(goRoutine.Country)
+									if !found {
+										log.Warnf("Country %s not found in proxyFiles", goRoutine.Country)
+										continue
+									}
+
+									err := setautoquarantineProxyFromFile(filePath, goRoutine.Url)
+									if err != nil {
+										log.Error("Failed to move proxy to quarantine", err)
+									}
+
+									currentUnavailable = append(currentUnavailable, goRoutine)
+
+									for i, okRoutine := range currentOK {
+										if goRoutine.Url == okRoutine.Url && goRoutine.Country == okRoutine.Country {
+											currentOK = append(currentOK[:i], currentOK[i+1:]...)
+										}
+									}
+
+									inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+										tgbotapi.NewInlineKeyboardRow(
+											tgbotapi.NewInlineKeyboardButtonData("remove", "remove"),
+										),
+									)
+									msg := tgbotapi.NewMessage(
+										tgChannelID,
+										fmt.Sprintf("[DEAD] Check failed.\nProxy: %s\nCountry: %s", goRoutine.Url, goRoutine.Country))
+									msg.ReplyMarkup = inlineKeyboard
+									if _, err := bot.Send(msg); err != nil {
+										log.Error("Failed to send message", err)
+									}
+								} else if differentCountryCount == 3 {
+									currentDifferentCountry = append(currentDifferentCountry, goRoutine)
+
+									for i, okRoutine := range currentOK {
+										if goRoutine.Url == okRoutine.Url && goRoutine.Country == okRoutine.Country {
+											currentOK = append(currentOK[:i], currentOK[i+1:]...)
+										}
+									}
+
+									inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+										tgbotapi.NewInlineKeyboardRow(
+											tgbotapi.NewInlineKeyboardButtonData("remove", "remove"),
+										),
+									)
+									msg := tgbotapi.NewMessage(
+										tgChannelID,
+										fmt.Sprintf("[COUNTRY DIFFERENT] Different country! (%s).\nProxy: %s\nCountry: %s", countryResponse, goRoutine.Url, goRoutine.Country))
+									msg.ReplyMarkup = inlineKeyboard
+									if _, err := bot.Send(msg); err != nil {
+										log.Error("Failed to send message", err)
+									}
+
+								} else {
+									time.Sleep(10 * time.Minute)
+								}
+							}
+						}
+					}(goRoutine)
+				} else {
+					for i, g := range proxiesChecksGoToDelete {
+						if g.Country == singleProxyFile.Country && g.Url == proxy {
+							proxiesChecksGoToDelete = append(proxiesChecksGoToDelete[:i], proxiesChecksGoToDelete[i+1:]...)
+						}
+					}
+				}
+
+			}
+		}
+		log.Tracef("proxiesChecksGoToDelete after: %v", proxiesChecksGoToDelete)
+		if len(proxiesChecksGoToDelete) > 0 {
+			for _, pcd := range proxiesChecksGoToDelete {
+				for i, pr := range currentOK {
+					if pr.Country == pcd.Country && pr.Url == pcd.Url {
+						log.Tracef("Removing from okList Country: %s Url: %s", pr.Country, pr.Url)
+						currentOK = append(currentOK[:i], currentOK[i+1:]...)
+					}
+				}
+				for i, pr := range currentUnavailable {
+					if pr.Country == pcd.Country && pr.Url == pcd.Url {
+						log.Tracef("Removing from okList Country: %s Url: %s", pr.Country, pr.Url)
+						currentOK = append(currentUnavailable[:i], currentUnavailable[i+1:]...)
+					}
+				}
+				for i, pr := range currentDifferentCountry {
+					if pr.Country == pcd.Country && pr.Url == pcd.Url {
+						log.Tracef("Removing from okList Country: %s Url: %s", pr.Country, pr.Url)
+						currentOK = append(currentDifferentCountry[:i], currentDifferentCountry[i+1:]...)
+					}
+				}
+				for i, pg := range proxyGoroutineList {
+					if pg.Country == pcd.Country && pg.Url == pcd.Url {
+						log.Tracef("Removing from proxyGoroutineList Country: %s Url: %s", pg.Country, pg.Url)
+						proxyGoroutineList = append(proxyGoroutineList[:i], proxyGoroutineList[i+1:]...)
+						close(pg.StopChan)
+					}
+				}
+
+			}
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func findFileByCountry(country string) (string, bool) {
+	for _, f := range proxyFiles {
+		if f.Country == country {
+			return f.File, true
+		}
+	}
+	return "", false
+}
+
+func searchProxyInProxyGoroutinesList(c string, p string) bool {
+	for _, g := range proxyGoroutineList {
+		if g.Country == c && g.Url == p {
+			return true
+		}
+	}
+	return false
+}
+
+func writeLog(l LogData) {
+	today := time.Now()
+	logDate := today.Format("2006-01-02 15:04:05 07TZ")
+	l.Logger.Infof("%s %s", logDate, l.Message)
+}
+
+func setProxyInFile(f string, l []string, format string, c string) (error, []string) {
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return err, nil
+	}
+
+	// разбиваем файл на строки
+	lines := strings.Split(string(data), "\n")
+	var clearedLines []string
+	var peerLines []string
+	for _, line := range lines {
+		if !strings.HasPrefix(line, "peer ") {
+			clearedLines = append(clearedLines, line)
+		} else {
+			peerLines = append(peerLines, line)
+		}
+	}
+
+	// удаляем строку, которую хотим удалить
+	for _, proxy := range l {
+
+		if format == "1" {
+			proxyPart := strings.Split(proxy, ":") //addr:port:login:pass
+			if len(proxyPart) < 4 {
+				return errors.New("неверный формат прокси: ожидалось 4 части"), nil
+			}
+
+			proxyAddr := proxyPart[0]
+			proxyPort := proxyPart[1]
+			proxyLogin := proxyPart[2]
+			proxyPass := proxyPart[3]
+
+			proxy = fmt.Sprintf("socks5h://%s:%s@%s:%s", proxyLogin, proxyPass, proxyAddr, proxyPort)
+		} else if format == "2" {
+			sepProxy := strings.SplitN(proxy, "://", 2)
+			proxyPart := strings.Split(sepProxy[1], ":") //addr:port:login:pass
+			if len(proxyPart) < 4 {
+				return errors.New("неверный формат прокси: ожидалось 4 части"), nil
+			}
+			proxyAddr := proxyPart[0]
+			proxyPort := proxyPart[1]
+			proxyLogin := proxyPart[2]
+			proxyPass := proxyPart[3]
+			proxy = fmt.Sprintf("%s://%s:%s@%s:%s", sepProxy[0], proxyLogin, proxyPass, proxyAddr, proxyPort)
+		} else if format == "3" {
+			proxy = fmt.Sprintf("socks5h://%s", proxy)
+		}
+
+		country, err := getCountry(proxy)
+		if err != nil {
+			return errors.New("Proxy check failed: No answer from site via proxy"), nil
+		}
+		if country != c {
+			return errors.New(fmt.Sprintf("Proxy check failed: Different country: %s (Must be %s)", country, c)), nil
+		}
+
+		clearedLines = append(clearedLines, fmt.Sprintf("peer %s", proxy))
+	}
+	// записываем новые строки обратно в файл
+	err = os.WriteFile(f, []byte(strings.Join(clearedLines, "\n")), 0o644)
+	if err != nil {
+		return err, nil
+	}
+
+	return nil, peerLines
+}
+
+func addProxyToFile(f string, p string) error {
+	file, err := os.OpenFile(f, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+
+	defer file.Close()
+
+	if _, err = file.WriteString(fmt.Sprintf("peer %s\n", p)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteProxyFromFile(f string, p string) error {
+	// читаем файл
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return err
+	}
+
+	// разбиваем файл на строки
+	lines := strings.Split(string(data), "\n")
+
+	// удаляем строку, которую хотим удалить
+	var newLines []string
+	var peerDeleted bool
+	for _, line := range lines {
+		if line != fmt.Sprintf("peer %s", p) || peerDeleted == true {
+			newLines = append(newLines, line)
+		} else {
+			peerDeleted = true
+		}
+	}
+
+	// записываем новые строки обратно в файл
+	err = os.WriteFile(f, []byte(strings.Join(newLines, "\n")), 0o644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func deleteQuarantineProxyFromFile(f string, p string) error {
+	// Читаем файл
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return err
+	}
+
+	// Разбиваем на строки
+	lines := strings.Split(string(data), "\n")
+
+	var newLines []string
+	var deleted bool // Флаг удаления — заменяет peerDeleted для ясности
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line) // Убираем лишние пробелы и переносы
+
+		// Проверяем, начинается ли строка с quarantine + proxy
+		if !deleted && strings.HasPrefix(line, "quarantine "+p) {
+			deleted = true // Пропускаем эту строку
+			continue
+		}
+
+		// Добавляем все остальные строки
+		newLines = append(newLines, line)
+	}
+
+	// Перезаписываем файл
+	err = os.WriteFile(f, []byte(strings.Join(newLines, "\n")), 0o644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// func deleteQuarantineProxyFromFile(f string, p string) error {
+// 	//  читаем файл
+// 	data, err := os.ReadFile(f)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	// разбиваем файл на строки
+// 	lines := strings.Split(string(data), "\n")
+
+// 	// удаляем строку, которую хотим удалить
+// 	var newLines []string
+// 	var peerDeleted bool
+// 	for _, line := range lines {
+// 		if line != fmt.Sprintf("quarantine %s", p) || peerDeleted == true {
+// 			newLines = append(newLines, line)
+// 		} else {
+// 			peerDeleted = true
+// 		}
+// 	}
+// 	fmt.Print(newLines)
+// 	// записываем новые строки обратно в файл
+// 	err = os.WriteFile(f, []byte(strings.Join(newLines, "\n")), 0o644)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	return nil
+// }
+
+// func getProxiesFromFile(filePath string) ([]string, error) {
+// 	data, err := os.ReadFile(filePath)
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	lines := strings.Split(string(data), "\n")
+// 	var peerLines []string
+// 	for _, line := range lines {
+// 		if strings.HasPrefix(line, "peer ") {
+// 			peerLines = append(peerLines, strings.TrimSpace(strings.TrimPrefix(line, "peer ")))
+// 		}
+// 	}
+
+// 	return peerLines, nil
+// }
+
+func getProxiesFromFile(filePath string) ([]string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(string(data), "\n")
+	var result []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line) // Убираем лишние пробелы по краям
+		if line == "" {
+			continue // Пропускаем пустые строки
+		}
+
+		if strings.HasPrefix(line, "peer ") {
+			// Убираем префикс "peer "
+			cleanLine := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
+			result = append(result, cleanLine)
+		}
+		if strings.HasPrefix(line, "quarantine ") {
+			cleanProxy := strings.TrimSpace(strings.TrimPrefix(line, "quarantine "))
+			result = append(result, fmt.Sprintf("QUARANTINE %s", cleanProxy))
+		}
+		if strings.HasPrefix(line, "autoquarantine ") {
+			cleanProxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
+			result = append(result, fmt.Sprintf("AUTOQUARANTINE %s", cleanProxy))
+		}
+
+	}
+
+	return result, nil
+}
+
+// // func prepareTgMessageActionUID (action string, country string, )
+// func buttonsPrepareFromList(prefix string, l []string) tgbotapi.ReplyKeyboardMarkup {
+// 	keyboard := tgbotapi.NewReplyKeyboard(
+// 		make([]tgbotapi.KeyboardButton, 0),
+// 	)
+// 	for _, item := range l {
+// 		keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+// 			tgbotapi.NewKeyboardButton(fmt.Sprintf("%s %s", prefix, item)),
+// 		))
+// 	}
+// 	keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+// 		tgbotapi.NewKeyboardButton(fmt.Sprintf("To begin")),
+// 	))
+// 	return keyboard
+// }
+
+func buttonsPrepareFromList(prefix string, l []string) tgbotapi.ReplyKeyboardMarkup {
+	keyboard := tgbotapi.NewReplyKeyboard()
+
+	// Разбиваем исходный prefix на части
+	prefixParts := strings.Fields(prefix)
+
+	for _, item := range l {
+		var finalPrefix string
+
+		// if strings.HasPrefix(prefixParts[0], "quarantine") {
+		// 	fields := strings.Fields(item)
+		// 	// fmt.Print(fields)
+		// 	if len(fields) >= 2 && fields[0] == "QUARANTINE" {
+		// 		finalPrefix = fmt.Sprintf("dequarantine %s", prefixParts[1])
+		// 	} else {
+		// 		finalPrefix = fmt.Sprintf("toquarantine %s", prefixParts[1])
+		// 	}
+		// } else {
+		// 	finalPrefix = prefix
+		// }
+
+		if strings.HasPrefix(prefixParts[0], "quarantine") {
+			fields := strings.Fields(item)
+			// fmt.Print(fields)
+			if len(fields) >= 2 && fields[0] == "QUARANTINE" {
+				finalPrefix = fmt.Sprintf("dequarantine %s", prefixParts[1])
+			} else if len(fields) >= 2 && fields[0] == "autoquarantine" {
+				finalPrefix = fmt.Sprintf("toquarantine %s", prefixParts[1])
+
+			} else {
+
+				finalPrefix = fmt.Sprintf("toquarantine %s", prefixParts[1])
+			}
+		} else {
+			finalPrefix = prefix
+		}
+
+		buttonText := fmt.Sprintf("%s %s", finalPrefix, item)
+
+		keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(buttonText),
+		))
+	}
+
+	keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+		tgbotapi.NewKeyboardButton("To begin"),
+	))
+
+	return keyboard
+}
+
+func proxiesListTgButtonWPrefix(s string, configs []ConfigProxyFiles, customButtons []string) tgbotapi.ReplyKeyboardMarkup {
+	keyboard := tgbotapi.NewReplyKeyboard(
+		make([]tgbotapi.KeyboardButton, 0),
+	)
+
+	for _, proxyFile := range configs {
+		country := proxyFile.Country
+		keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(fmt.Sprintf("%s %s", s, country)),
+		))
+	}
+	for _, b := range customButtons {
+		keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+			tgbotapi.NewKeyboardButton(b),
+		))
+	}
+	keyboard.Keyboard = append(keyboard.Keyboard, tgbotapi.NewKeyboardButtonRow(
+		tgbotapi.NewKeyboardButton(fmt.Sprintf("To begin")),
+	))
+
+	return keyboard
+}
+
+func checkProxies(bot *tgbotapi.BotAPI, channelID int64, configs []ConfigProxyFiles) {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for _, config := range configs {
+			proxies, err := readProxies(config.File)
+			if err != nil {
+				log.Error("Failed to read proxies in checker", err)
+				continue
+			}
+			for _, proxy := range proxies {
+				// Check country change
+				country, err := getCountry(proxy)
+				if err != nil {
+					log.Error("[DEAD] Check failed to get country", err)
+
+					inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("remove", "remove"),
+						),
+					)
+					msg := tgbotapi.NewMessage(channelID, fmt.Sprintf("[DEAD] Check failed.\nProxy: %s\nCountry: %s", proxy, config.Country))
+
+					msg.ReplyMarkup = inlineKeyboard
+					if _, err := bot.Send(msg); err != nil {
+						log.Error("Failed to send message", err)
+					}
+					continue
+				} else {
+					log.Debug(fmt.Sprintf("[Alive] Check succesfull. Proxy: %s , Country %s ", proxy, config.Country))
+				}
+
+				if country != config.Country {
+					log.Error(fmt.Sprintf("[Country] Check failed. Country is different. Proxy: %s , Country: %s , Proxy Country: %s", proxy, config.Country, country))
+					// Notify users
+
+					inlineKeyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(
+							tgbotapi.NewInlineKeyboardButtonData("remove", "remove"),
+						),
+					)
+
+					msg := tgbotapi.NewMessage(channelID, fmt.Sprintf("Proxy %s changed country from %s to %s!", proxy, config.Country, country))
+					msg.ReplyMarkup = &inlineKeyboard
+
+					if _, err := bot.Send(msg); err != nil {
+						log.Error("Failed to send message", err)
+					}
+
+				} else {
+					log.Debug(fmt.Sprintf("[Alive] Check succesfull. Proxy: %s , Country %s , Proxy Country %s", proxy, config.Country, country))
+				}
+			}
+		}
+	}
+}
+
+func checkListContainsString(s []string, str string) bool {
+	for _, v := range s {
+		if v == str {
+			return true
+		}
+	}
+	return false
+}
+
+func checkListContainsInt64(s []int64, e int64) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
+}
+
+func readProxies(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var proxies []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "peer") {
+			proxies = append(proxies, strings.TrimSpace(line[5:]))
+		}
+		if strings.HasPrefix(line, "autoquarantine") {
+			proxies = append(proxies, strings.TrimSpace(line[15:]))
+		}
+	}
+
+	return proxies, scanner.Err()
+}
+
+func proxyCheck(proxy string, checkUrl string, getCountry bool) ProxyCheckResponse {
+	a := ProxyCheckResponse{Available: false, Country: "", Error: nil, Body: ""}
+
+	proxyUrl, err := url.Parse(proxy)
+	if err != nil {
+		a.Error = err
+		return a
+	}
+	transport := &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+	client := &http.Client{Transport: transport}
+
+	resp, err := client.Get(checkUrl)
+	if err != nil {
+		a.Error = err
+		return a
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPermanentRedirect || resp.StatusCode == http.StatusTemporaryRedirect {
+		a.Available = true
+	} else {
+		a.Error = err
+		return a
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.Error = err
+		return a
+	}
+	a.Body = string(body)
+
+	if getCountry {
+		var data map[string]interface{}
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		if err != nil {
+			a.Error = err
+			return a
+		}
+
+		country, ok := data["country"].(string)
+		if !ok {
+			a.Error = fmt.Errorf("country field not found in JSON response")
+			return a
+		} else {
+			a.Country = country
+		}
+	}
+
+	return a
+}
+
+func getCountry(proxy string) (string, error) {
+	time.Sleep(2 * time.Second)
+	// Get country from ipinfo.io
+	proxyUrl, err := url.Parse(proxy)
+	if err != nil {
+		return "[func getCountry] Can't parse proxy url", err
+	}
+
+	transport := &http.Transport{Proxy: http.ProxyURL(proxyUrl)}
+	client := &http.Client{Transport: transport}
+
+	resp, err := client.Get("https://ipinfo.io/")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", err
+	}
+
+	var data map[string]interface{}
+	err = json.NewDecoder(resp.Body).Decode(&data)
+	if err != nil {
+		return "", err
+	}
+
+	country, ok := data["country"].(string)
+	if !ok {
+		return "", fmt.Errorf("country field not found in JSON response")
+	}
+
+	return country, nil
+}
+
+func addProxy(bot *tgbotapi.BotAPI, chatID int64) {
+	// Create new message with keyboard
+	keyboard := tgbotapi.ReplyKeyboardMarkup{
+		Keyboard: [][]tgbotapi.KeyboardButton{
+			{
+				tgbotapi.KeyboardButton{
+					Text: "Add proxy",
+				},
+			},
+		},
+	}
+
+	msg := tgbotapi.NewMessage(chatID, "Add new proxy")
+	msg.ReplyMarkup = &keyboard
+
+	if _, err := bot.Send(msg); err != nil {
+		log.Error(err)
+	}
+}
+
+func removeProxyFromFile(filename string, proxy string) error {
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "peer "+proxy) {
+			lines = append(lines, line)
+		}
+	}
+
+	err = os.Truncate(filename, 0)
+	if err != nil {
+		return err
+	}
+
+	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	for _, line := range lines {
+		_, err := file.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func setquarantineProxyFromFile(filename string, proxy string) error {
+	// Открываем файл для чтения
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Читаем содержимое файла построчно
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Проверяем, начинается ли строка с "peer "+proxy
+		if strings.HasPrefix(line, "peer "+proxy) {
+			// Заменяем "peer" на "quarantine"
+			line = strings.Replace(line, "peer", "quarantine", 1)
+		}
+
+		if strings.HasPrefix(line, "autoquarantine "+proxy) {
+			// Заменяем "autoquarantine" на "quarantine"
+			line = strings.Replace(line, "autoquarantine", "quarantine", 1)
+		}
+
+		// Добавляем строку (изменённую или нет) в список
+		lines = append(lines, line)
+	}
+
+	// Очищаем файл, чтобы перезаписать его
+	err = os.Truncate(filename, 0)
+	if err != nil {
+		return err
+	}
+
+	// Открываем файл для записи
+	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Записываем все строки обратно в файл
+	for _, line := range lines {
+		_, err := file.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func setautoquarantineProxyFromFile(filename string, proxy string) error {
+	// Открываем файл для чтения
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Проверяем, начинается ли строка с "peer " и содержит ли она нужный прокси
+		if strings.HasPrefix(line, "peer ") {
+			existingProxy := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
+			if existingProxy == proxy {
+				// Заменяем "peer" на "autoquarantine"
+				line = strings.Replace(line, "peer ", "autoquarantine ", 1)
+			}
+		}
+
+		lines = append(lines, line)
+	}
+
+	// Перезаписываем файл
+	err = os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// func setautoquarantineProxyFromFile(filename string, proxy string) error {
+// 	// Открываем файл для чтения
+// 	file, err := os.Open(filename)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer file.Close()
+
+// 	// Читаем содержимое файла построчно
+// 	var lines []string
+// 	scanner := bufio.NewScanner(file)
+// 	for scanner.Scan() {
+// 		line := scanner.Text()
+
+// 		// Проверяем, начинается ли строка с "peer "+proxy
+// 		if strings.HasPrefix(line, "peer "+proxy) {
+// 			// Заменяем "peer" на "autoquarantine"
+// 			line = strings.Replace(line, "peer", "autoquarantine", 1)
+// 		}
+
+// 		// Добавляем строку (изменённую или нет) в список
+// 		lines = append(lines, line)
+// 	}
+
+// 	// Очищаем файл, чтобы перезаписать его
+// 	err = os.Truncate(filename, 0)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	// Открываем файл для записи
+// 	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer file.Close()
+
+// 	// Записываем все строки обратно в файл
+// 	for _, line := range lines {
+// 		_, err := file.WriteString(line + "\n")
+// 		if err != nil {
+// 			return err
+// 		}
+// 	}
+
+// 	return nil
+// }
+
+func outquarantineProxyFromFile(filename string, proxy string) error {
+	// Открываем файл для чтения
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Читаем содержимое файла построчно
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Проверяем, начинается ли строка с "quarantine "+proxy
+
+		if strings.HasPrefix(line, "quarantine "+proxy) {
+			line = strings.Replace(line, "quarantine", "peer", 1)
+
+		}
+
+		// Добавляем строку (изменённую или нет) в список
+		lines = append(lines, line)
+	}
+
+	// Очищаем файл, чтобы перезаписать его
+	err = os.Truncate(filename, 0)
+	if err != nil {
+		return err
+	}
+
+	// Открываем файл для записи
+	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Записываем все строки обратно в файл
+	for _, line := range lines {
+		_, err := file.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func outautoquarantineProxyFromFile(filename string, proxy string) error {
+	// Открываем файл для чтения
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Читаем содержимое файла построчно
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		// Проверяем, начинается ли строка с "quarantine "+proxy
+
+		if strings.HasPrefix(line, "autoquarantine "+proxy) {
+			line = strings.Replace(line, "autoquarantine", "peer", 1)
+
+		}
+
+		// Добавляем строку (изменённую или нет) в список
+		lines = append(lines, line)
+	}
+
+	// Очищаем файл, чтобы перезаписать его
+	err = os.Truncate(filename, 0)
+	if err != nil {
+		return err
+	}
+
+	// Открываем файл для записи
+	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Записываем все строки обратно в файл
+	for _, line := range lines {
+		_, err := file.WriteString(line + "\n")
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func splitMessageByNewline(message string) []string {
+	var messages []string
+	lines := strings.Split(message, "\n") // Разбиваем текст на строки
+	currentMessage := ""
+	currentLength := 0
+
+	for _, line := range lines {
+		lineLength := len([]rune(line)) + 1 // +1 для учета \n
+
+		// Если добавление строки превысит лимит
+		if currentLength+lineLength > 4000 {
+			if currentMessage != "" {
+				messages = append(messages, strings.TrimSpace(currentMessage))
+			}
+			currentMessage = line // Начинаем новое сообщение с текущей строки
+			currentLength = lineLength
+		} else {
+			// Добавляем строку к текущему сообщению
+			if currentMessage != "" {
+				currentMessage += "\n"
+			}
+			currentMessage += line
+			currentLength += lineLength
+		}
+	}
+
+	// Добавляем последнее сообщение, если оно не пустое
+	if currentMessage != "" {
+		messages = append(messages, strings.TrimSpace(currentMessage))
+	}
+
+	return messages
+}

@@ -1,0 +1,2 @@
+autoquarantine socks5h://user_ru1:pass_ru1@192.168.1.20:1080
+quarantine socks5h://user_ru2:pass_ru2@192.168.1.21:1080

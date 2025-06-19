@@ -1,0 +1,36 @@
+# Telegram настройки
+tg_token: "7893876708:AAF9uGJhlVMbQUdlLUluXMLwe5Ku0_WF_7Y"
+tg_channel: 7437739190  # ID канала или чата для уведомлений
+tg_acl:
+  - "7437739190"  # Разрешённые пользователи (ID) для управления ботом
+
+# Файлы прокси, разделённые по странам
+proxy_files:
+  - file: "./proxies/ru_proxies.txt"
+    country: "RU"
+  - file: "./proxies/us_proxies.txt"
+    country: "US"
+  - file: "./proxies/de_proxies.txt"
+    country: "DE"
+
+# Настройки проверки прокси
+proxyRequestTimeout: 10s  # Таймаут запроса через прокси
+auto_checks_enable: true  # Автоматическая проверка прокси каждые 10 минут
+on_add_checks_enable: true  # Проверять прокси сразу после добавления
+
+# Проверочные URL'ы
+proxy_checks:
+  default:
+    - url: "https://ifconfig.me/ip" 
+      getCountry: true
+    - url: "https://ip-api.com/json" 
+      getCountry: true
+
+# Директория логов
+logs_dir: "./logs"
+
+# Уровень логирования (trace, debug, info, warn, error, fatal)
+logs_verbose: "info"
+
+# Включить автообновление конфигурации при изменении файла
+config_reload_enabled: true
