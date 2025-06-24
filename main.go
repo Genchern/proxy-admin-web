@@ -118,29 +118,9 @@ func main() {
 	})
 
 	// Пример маршрутов с параметрами
-	app.Get("/delete/:country/:proxy", func(c fiber.Ctx) error {
-		country := c.Params("country")
-		proxy := c.Params("proxy")
-		log.Printf("Удалён прокси: %s -> %s", country, proxy)
+	app.Get("/delete/:country/:proxy", deleteProxy)
 
-		return c.Redirect().To("/dashboard")
-	})
-
-	app.Get("/quarantine/:country/:proxy", func(c fiber.Ctx) error {
-		country := c.Params("country")
-		proxy := c.Params("proxy")
-		log.Printf("Прокси переведён в карантин: %s -> %s", country, proxy)
-
-		return c.Redirect().To("/dashboard")
-	})
-
-	// app.Get("/dequarantine/:country/:proxy", func(c fiber.Ctx) error {
-	// 	country := c.Params("country")
-	// 	proxy := c.Params("proxy")
-	// 	log.Printf("Прокси восстановлен из карантина: %s -> %s", country, proxy)
-
-	// 	return c.Redirect().To("/dashboard")
-	// })
+	app.Get("/quarantine/:country/:proxy", quarantineProxy)
 
 	app.Get("/dequarantine/:country/:proxy", dequarantineProxy)
 
@@ -179,7 +159,7 @@ func loadProxyFiles() {
 }
 
 func autoQuarantineCheck() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
@@ -247,26 +227,6 @@ func getProxiesFromFile(filePath string) ([]string, error) {
 
 	return result, nil
 }
-
-// func getProxiesFromFile(filePath string) ([]string, error) {
-// 	data, err := os.ReadFile(filePath)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-
-// 	lines := strings.Split(string(data), "\n")
-// 	var result []string
-// 	for _, line := range lines {
-// 		line = strings.TrimSpace(line)
-// 		if strings.HasPrefix(line, "peer ") {
-// 			result = append(result, strings.TrimPrefix(line, "peer "))
-// 		}
-// 		if strings.HasPrefix(line, "autoquarantine ") {
-// 			result = append(result, "QUARANTINE "+strings.TrimPrefix(line, "autoquarantine "))
-// 		}
-// 	}
-// 	return result, nil
-// }
 
 func setAutoQuarantine(filename, proxy string) error {
 	mu.Lock()
@@ -411,14 +371,14 @@ func dashboard(c fiber.Ctx) error {
 		for _, proxy := range proxies {
 			html.WriteString("<li>")
 
-			if strings.HasPrefix(proxy, "quarantine ") {
-				cleanProxy := proxy[11:] // убираем "quarantine "
-				html.WriteString(fmt.Sprintf("🟡 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
-					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
-			} else if strings.HasPrefix(proxy, "autoquarantine ") {
+			if strings.HasPrefix(proxy, "autoquarantine ") {
 				cleanProxy := proxy[14:] // убираем "autoquarantine "
-				html.WriteString(fmt.Sprintf("🔴 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
-					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
+				html.WriteString(fmt.Sprintf("🟡 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
+					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+			} else if strings.HasPrefix(proxy, "quarantine ") {
+				cleanProxy := proxy[11:] // убираем "quarantine "
+				html.WriteString(fmt.Sprintf("🔴 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
+					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
 			} else {
 				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
 					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
@@ -434,113 +394,14 @@ func dashboard(c fiber.Ctx) error {
 	return c.Type("html", "utf-8").SendString(html.String())
 }
 
-// func dashboard(c fiber.Ctx) error {
-// 	auth := c.Cookies("auth") != ""
-// 	if !auth {
-// 		return c.Redirect().To("/")
-// 	}
-
-// 	proxyMap := make(map[string][]string)
-// 	for _, pf := range proxyFiles {
-// 		proxies, _ := getProxiesFromFile(pf.File)
-// 		proxyMap[pf.Country] = proxies
-// 	}
-
-// 	// Генерация HTML вручную
-// 	var html strings.Builder
-
-// 	// Получаем сообщение из query-параметра
-// 	message := c.Query("message")
-
-// 	html.WriteString(`<!DOCTYPE html>
-// 	<html>
-// 	<head>
-// 	<meta charset="UTF-8">
-// 	<title>Proxy Admin Panel</title>
-// 	<link rel="stylesheet" href="/static/style.css">
-// 	</head>
-// 	<body>`)
-
-// 	// Выводим сообщение, если оно есть
-// 	if message != "" {
-// 		// Экранируем для безопасности
-// 		safeMessage := url.QueryEscape(message)
-// 		html.WriteString(fmt.Sprintf(`
-// 	<div id="flashMessage" style="
-// 		position: fixed;
-// 		top: 20px;
-// 		right: 20px;
-// 		background-color: #d4edda;
-// 		color: #155724;
-// 		padding: 10px 20px;
-// 		border-radius: 5px;
-// 		box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-// 		z-index: 9999;
-// 		transition: opacity 0.5s;
-// 	">%s</div>
-// 	<script>
-// 		setTimeout(function() {
-// 			var msg = document.getElementById('flashMessage');
-// 			if (msg) {
-// 				msg.style.opacity = '0';
-// 				setTimeout(function() { msg.remove(); }, 500);
-// 			}
-// 		}, 3000);
-// 	</script>`, safeMessage))
-// 	}
-
-// 	// Основной контент
-// 	html.WriteString(`
-// 	<h1>Proxy List by Country</h1>
-
-// 	<form method="POST" action="/add-proxy">
-// 	<select name="country">
-// 	<option value="Russia">Russia</option>
-// 	<option value="USA">USA</option>
-// 	</select>
-// 	<input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
-// 	<select name="format">
-// 	<option value="1">Format 1: addr:port:user:pass</option>
-// 	<option value="2">Format 2: proto://addr:port:user:pass</option>
-// 	<option value="3">Format 3: user:pass@addr:port</option>
-// 	<option value="4">Format 4: proto://user:pass@addr:port</option>
-// 	</select>
-// 	<button type="submit">Add Proxy</button>
-// 	</form>`)
-
-// 	for country, proxies := range proxyMap {
-// 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
-// 		for _, proxy := range proxies {
-// 			html.WriteString("<li>")
-
-// 			if len(proxy) > 8 && proxy[:9] == "quarantine " {
-// 				cleanProxy := proxy[9:]
-// 				html.WriteString(fmt.Sprintf("🟡 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
-// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
-// 			} else if strings.HasPrefix(proxy, "autoquarantine ") {
-// 				cleanProxy := strings.TrimPrefix(proxy, "autoquarantine ")
-// 				html.WriteString(fmt.Sprintf("🔴 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a>",
-// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(cleanProxy)))
-// 			} else {
-// 				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
-// 					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
-// 			}
-
-// 			html.WriteString("</li>")
-// 		}
-// 		html.WriteString("</ul>")
-// 	}
-
-// 	html.WriteString(`</body></html>`)
-
-// 	return c.Type("html", "utf-8").SendString(html.String())
-// }
-
 func deleteProxy(c fiber.Ctx) error {
 	country := c.Params("country")
 	proxy := c.Params("proxy")
+	fmt.Printf("Страна: %s | Прокси: %s", country, proxy)
 	for _, pf := range proxyFiles {
+		fmt.Printf("Файл: %s | Прокси: %s\n", pf.File, proxy)
 		if pf.Country == country {
+
 			removeProxyFromFile(pf.File, proxy)
 		}
 	}
@@ -615,6 +476,18 @@ func logs(c fiber.Ctx) error {
 }
 
 func removeProxyFromFile(filename string, proxy string) error {
+	fmt.Printf("Обычный прокси: %s\n", proxy)
+	decodedProxy, err := url.QueryUnescape(proxy)
+	if err != nil {
+		decodedProxy = proxy
+	}
+
+	decodedProxy = strings.TrimSpace(decodedProxy)
+	fmt.Printf("Декодированный прокси: %s\n", decodedProxy)
+
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Открываем файл для чтения
 	file, err := os.Open(filename)
 	if err != nil {
@@ -628,13 +501,14 @@ func removeProxyFromFile(filename string, proxy string) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 
-		// Проверяем, начинается ли строка с "peer " и содержит ли нужный прокси
-		if strings.HasPrefix(line, "peer ") {
-			existingProxy := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
-			if existingProxy == proxy {
-				// Пропускаем эту строку (не добавляем в список), тем самым удаляя её
-				continue
-			}
+		// Проверяем строку на наличие любого из возможных префиксов и совпадение прокси
+		if (strings.HasPrefix(line, "peer ") ||
+			strings.HasPrefix(line, "quarantine ") ||
+			strings.HasPrefix(line, "autoquarantine ")) &&
+			strings.Contains(line, decodedProxy) {
+
+			// Пропускаем эту строку — тем самым удаляем её
+			continue
 		}
 
 		// Все остальные строки сохраняем
@@ -651,6 +525,18 @@ func removeProxyFromFile(filename string, proxy string) error {
 }
 
 func setquarantineProxyFromFile(filename string, proxy string) error {
+	// fmt.Printf("Обычный прокси: %s\n", proxy)
+	decodedProxy, err := url.QueryUnescape(proxy)
+	if err != nil {
+		decodedProxy = proxy
+	}
+
+	decodedProxy = strings.TrimSpace(decodedProxy)
+	fmt.Printf("Декодированный прокси: %s\n", decodedProxy)
+
+	mu.Lock()
+	defer mu.Unlock()
+
 	// Открываем файл для чтения
 	file, err := os.Open(filename)
 	if err != nil {
@@ -667,7 +553,7 @@ func setquarantineProxyFromFile(filename string, proxy string) error {
 		// Проверяем, начинается ли строка с "peer " и содержит ли нужный прокси
 		if strings.HasPrefix(line, "peer ") {
 			existingProxy := strings.TrimSpace(strings.TrimPrefix(line, "peer "))
-			if existingProxy == proxy {
+			if existingProxy == decodedProxy {
 				// Заменяем "peer" на "quarantine"
 				line = strings.Replace(line, "peer ", "quarantine ", 1)
 			}
@@ -676,7 +562,7 @@ func setquarantineProxyFromFile(filename string, proxy string) error {
 		// Также проверяем строки autoquarantine и переводим их в quarantine
 		if strings.HasPrefix(line, "autoquarantine ") {
 			existingProxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
-			if existingProxy == proxy {
+			if existingProxy == decodedProxy {
 				line = strings.Replace(line, "autoquarantine ", "quarantine ", 1)
 			}
 		}
@@ -693,7 +579,9 @@ func setquarantineProxyFromFile(filename string, proxy string) error {
 
 	return nil
 }
+
 func outquarantineProxyFromFile(filename string, proxy string) error {
+	fmt.Printf("Обычный прокси: %s\n", proxy)
 	decodedProxy, err := url.QueryUnescape(proxy)
 	if err != nil {
 		decodedProxy = proxy
@@ -716,12 +604,28 @@ func outquarantineProxyFromFile(filename string, proxy string) error {
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "autoquarantine "+decodedProxy) {
-			line = "peer " + decodedProxy
-		} else if strings.HasPrefix(line, "quarantine "+decodedProxy) {
-			line = "peer " + decodedProxy
+
+		// Проверяем, является ли строка quarantine или autoquarantine и содержит нужный прокси
+		if strings.HasPrefix(line, "quarantine ") &&
+			strings.Contains(line, decodedProxy) {
+
+			cleandecodedProxy := decodedProxy[11:] // убираем "quarantine "
+
+			// Меняем префикс на peer
+			lines = append(lines, "peer "+cleandecodedProxy)
+
+		} else if strings.HasPrefix(line, "autoquarantine ") &&
+			strings.Contains(line, decodedProxy) {
+
+			cleandecodedProxy := decodedProxy[14:] // убираем "autoquarantine "
+
+			// Меняем префикс на peer
+			lines = append(lines, "peer "+cleandecodedProxy)
+		} else {
+			// Сохраняем все остальные строки как есть
+			lines = append(lines, line)
 		}
-		lines = append(lines, line)
+
 	}
 
 	err = os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
@@ -731,83 +635,6 @@ func outquarantineProxyFromFile(filename string, proxy string) error {
 
 	return nil
 }
-
-// func outquarantineProxyFromFile(filename string, proxy string) error {
-
-// 	fmt.Print(proxy)
-// 	// Открываем файл для чтения
-// 	file, err := os.Open(filename)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer file.Close()
-
-// 	// Читаем содержимое файла построчно
-// 	var lines []string
-// 	scanner := bufio.NewScanner(file)
-// 	for scanner.Scan() {
-// 		line := scanner.Text()
-
-// 		if strings.HasPrefix(line, "quarantine "+proxy) {
-// 			line = strings.Replace(line, "quarantine", "peer", 1)
-
-// 		}
-// 		// if strings.HasPrefix(line, "quarantine "+proxy) || strings.HasPrefix(line, "autoquarantine "+proxy) {
-// 		// 	line = "peer " + proxy // Восстанавливаем как peer
-// 		// }
-// 		lines = append(lines, line)
-// 	}
-
-// 	// Очищаем файл, чтобы перезаписать его
-// 	err = os.Truncate(filename, 0)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	// Открываем файл для записи
-// 	file, err = os.OpenFile(filename, os.O_WRONLY, 0o644)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer file.Close()
-
-// 	// Записываем все строки обратно в файл
-// 	for _, line := range lines {
-// 		_, err := file.WriteString(line + "\n")
-// 		if err != nil {
-// 			return err
-// 		}
-// 	}
-
-// 	return nil
-// }
-
-// func outquarantineProxyFromFile(filename string, proxy string) error {
-// 	fmt.Print(filename, proxy)
-// 	file, err := os.Open(filename)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer file.Close()
-
-// 	var lines []string
-// 	scanner := bufio.NewScanner(file)
-
-// 	for scanner.Scan() {
-// 		line := scanner.Text()
-// 		if strings.HasPrefix(line, "quarantine "+proxy) || strings.HasPrefix(line, "autoquarantine "+proxy) {
-// 			line = "peer " + proxy // Восстанавливаем как peer
-// 		}
-// 		lines = append(lines, line)
-// 	}
-
-// 	err = os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	return nil
-// }
 
 func addProxyToFile(filename string, proxy string) error {
 	// Открываем файл в режиме дозаписи (Append), записи (Write) и создания при отсутствии (Create)
