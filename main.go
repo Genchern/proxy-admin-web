@@ -274,17 +274,134 @@ func outAutoQuarantine(filename, proxy string) error {
 	return os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
 }
 
-// handlers/proxy_handlers.go
+// // handlers/proxy_handlers.go
+// func dashboard(c fiber.Ctx) error {
+// 	auth := c.Cookies("auth") != ""
+// 	if !auth {
+// 		return c.Redirect().To("/")
+// 	}
+
+// 	// Получаем сообщение из куки
+// 	flashMsg := c.Cookies("flash", "")
+// 	if flashMsg != "" {
+// 		// Удаляем куку после чтения
+// 		c.Cookie(&fiber.Cookie{
+// 			Name:     "flash",
+// 			Value:    "",
+// 			Expires:  time.Now().Add(-time.Hour),
+// 			HTTPOnly: true,
+// 			SameSite: "Lax",
+// 		})
+// 	}
+
+// 	proxyMap := make(map[string][]string)
+// 	for _, pf := range proxyFiles {
+// 		proxies, _ := getProxiesFromFile(pf.File)
+// 		proxyMap[pf.Country] = proxies
+// 	}
+
+// 	var html strings.Builder
+
+// 	html.WriteString(`<!DOCTYPE html>
+// <html>
+// <head>
+// <meta charset="UTF-8">
+// <title>Proxy Admin Panel</title>
+// <link rel="stylesheet" href="/static/style.css">
+// </head>
+// <body>`)
+
+// 	// Выводим сообщение, если оно есть
+// 	if flashMsg != "" {
+// 		html.WriteString(fmt.Sprintf(`
+// <div id="flashMessage" style="
+//     position: fixed;
+//     top: 20px;
+//     right: 20px;
+//     background-color: #d4edda;
+//     color: #155724;
+//     padding: 10px 20px;
+//     border-radius: 5px;
+//     box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+//     z-index: 9999;
+//     transition: opacity 0.5s;
+// ">%s</div>
+// <script>
+//     setTimeout(function() {
+//         var msg = document.getElementById('flashMessage');
+//         if (msg) {
+//             msg.style.opacity = '0';
+//             setTimeout(function() { msg.remove(); }, 500);
+//         }
+//     }, 3000);
+// </script>`, flashMsg))
+// 	}
+
+// 	html.WriteString(`
+// <h1>Proxy List by Country</h1>
+
+// <form method="POST" action="/add-proxy">
+// <select name="country">`)
+// 	filesMutex.RLock()
+// 	for _, pf := range proxyFiles {
+// 		html.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`, pf.Country, pf.Country))
+// 	}
+// 	filesMutex.RUnlock()
+// 	html.WriteString(`</select>
+// <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
+// <select name="format">
+// <option value="1">Format 1: addr:port:user:pass</option>
+// <option value="2">Format 2: proto://addr:port:user:pass</option>
+// <option value="3">Format 3: user:pass@addr:port</option>
+// <option value="4">Format 4: proto://user:pass@addr:port</option>
+// </select>
+// <button type="submit">Add Proxy</button>
+// </form>
+
+// <h2>Add Country</h2>
+// <form method="POST" action="/add-country">
+// <input type="text" name="countryName" placeholder="Country Name (e.g., Germany)" required>
+// <input type="text" name="countryCode" placeholder="Country Code (e.g., DE)" required>
+// <button type="submit">Add Country</button>
+// </form>
+// `)
+
+// 	for country, proxies := range proxyMap {
+// 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
+// 		for _, proxy := range proxies {
+// 			html.WriteString("<li>")
+
+// 			if strings.HasPrefix(proxy, "autoquarantine ") {
+// 				cleanProxy := proxy[14:] // убираем "autoquarantine "
+// 				html.WriteString(fmt.Sprintf("🟡 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
+// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+// 			} else if strings.HasPrefix(proxy, "quarantine ") {
+// 				cleanProxy := proxy[11:] // убираем "quarantine "
+// 				html.WriteString(fmt.Sprintf("🔴 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
+// 					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+// 			} else {
+// 				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
+// 					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+// 			}
+
+// 			html.WriteString("</li>")
+// 		}
+// 		html.WriteString("</ul>")
+// 	}
+
+// 	html.WriteString(`</body></html>`)
+
+// 	return c.Type("html", "utf-8").SendString(html.String())
+// }
+
 func dashboard(c fiber.Ctx) error {
 	auth := c.Cookies("auth") != ""
 	if !auth {
 		return c.Redirect().To("/")
 	}
 
-	// Получаем сообщение из куки
 	flashMsg := c.Cookies("flash", "")
 	if flashMsg != "" {
-		// Удаляем куку после чтения
 		c.Cookie(&fiber.Cookie{
 			Name:     "flash",
 			Value:    "",
@@ -308,10 +425,67 @@ func dashboard(c fiber.Ctx) error {
 <meta charset="UTF-8">
 <title>Proxy Admin Panel</title>
 <link rel="stylesheet" href="/static/style.css">
+<style>
+.proxy-card {
+    margin: 10px 0;
+    padding: 10px;
+    background-color: #fff;
+    border-radius: 8px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    font-family: monospace;
+    white-space: nowrap;        /* Запрещаем перенос текста */
+    width: 100%;                /* На всю ширину */
+    max-width: 100%;
+    overflow-x: auto;           /* Добавляем горизонтальный скролл при необходимости */
+}
+.proxy-card.quarantined {
+    border-left: 4px solid #dc3545;
+    color: #721c24;
+    background-color: #f8d7da;
+}
+.proxy-card.autoquarantined {
+    border-left: 4px solid #ffc107;
+    color: #856404;
+    background-color: #fff3cd;
+}
+.proxy-url {
+    display: block;
+    font-size: 16px;
+    word-break: break-all;     
+    min-width: 300px;
+}
+.actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.btn {
+    text-decoration: none;
+    color: white;
+    background-color: #007bff;
+    padding: 4px 10px;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+}
+.btn.quarantine {
+    background-color: #ffc107; /* Жёлтый */
+    color: #212529;
+}
+.btn.restore {
+    background-color: #28a745; /* Зелёный */
+}
+.btn.delete {
+    background-color: #dc3545; /* Красный */
+}
+.btn:hover {
+    opacity: 0.9;
+}
+</style>
 </head>
 <body>`)
 
-	// Выводим сообщение, если оно есть
+	// Вывод флеш-сообщения (если есть)
 	if flashMsg != "" {
 		html.WriteString(fmt.Sprintf(`
 <div id="flashMessage" style="
@@ -327,13 +501,13 @@ func dashboard(c fiber.Ctx) error {
     transition: opacity 0.5s;
 ">%s</div>
 <script>
-    setTimeout(function() {
-        var msg = document.getElementById('flashMessage');
-        if (msg) {
-            msg.style.opacity = '0';
-            setTimeout(function() { msg.remove(); }, 500);
-        }
-    }, 3000);
+setTimeout(function() {
+    var msg = document.getElementById('flashMessage');
+    if (msg) {
+        msg.style.opacity = '0';
+        setTimeout(function() { msg.remove(); }, 500);
+    }
+}, 3000);
 </script>`, flashMsg))
 	}
 
@@ -347,6 +521,7 @@ func dashboard(c fiber.Ctx) error {
 		html.WriteString(fmt.Sprintf(`<option value="%s">%s</option>`, pf.Country, pf.Country))
 	}
 	filesMutex.RUnlock()
+
 	html.WriteString(`</select>
 <input type="text" name="proxy" placeholder="addr:port:user:pass or socks5://..." required>
 <select name="format">
@@ -363,25 +538,54 @@ func dashboard(c fiber.Ctx) error {
 <input type="text" name="countryName" placeholder="Country Name (e.g., Germany)" required>
 <input type="text" name="countryCode" placeholder="Country Code (e.g., DE)" required>
 <button type="submit">Add Country</button>
-</form>
-`)
+</form>`)
 
 	for country, proxies := range proxyMap {
 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
+
 		for _, proxy := range proxies {
 			html.WriteString("<li>")
 
 			if strings.HasPrefix(proxy, "autoquarantine ") {
 				cleanProxy := proxy[14:] // убираем "autoquarantine "
-				html.WriteString(fmt.Sprintf("🟡 Autoquarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
-					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+				html.WriteString(fmt.Sprintf(`
+<div class="proxy-card autoquarantined">
+    <span class="proxy-url">🟡 Autoquarantined: %s</span>
+    <div class="actions">
+        <a href="/dequarantine/%s/%s" class="btn restore">Restore</a>
+        <a href="/delete/%s/%s" class="btn delete">Delete</a>
+    </div>
+</div>`,
+					cleanProxy,
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy)))
+
 			} else if strings.HasPrefix(proxy, "quarantine ") {
 				cleanProxy := proxy[11:] // убираем "quarantine "
-				html.WriteString(fmt.Sprintf("🔴 Quarantined: %s <a href=\"/dequarantine/%s/%s\">Restore</a> <a href=\"/delete/%s/%s\">Delete</a>",
-					cleanProxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+				html.WriteString(fmt.Sprintf(`
+<div class="proxy-card quarantined">
+    <span class="proxy-url">🔴 Quarantined: %s</span>
+    <div class="actions">
+        <a href="/dequarantine/%s/%s" class="btn restore">Restore</a>
+        <a href="/delete/%s/%s" class="btn delete">Delete</a>
+    </div>
+</div>`,
+					cleanProxy,
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy)))
+
 			} else {
-				html.WriteString(fmt.Sprintf("🟢 Active: %s <a href=\"/quarantine/%s/%s\"> Quarantine</a> <a href=\"/delete/%s/%s\">Delete</a>",
-					proxy, url.QueryEscape(country), url.QueryEscape(proxy), url.QueryEscape(country), url.QueryEscape(proxy)))
+				html.WriteString(fmt.Sprintf(`
+<div class="proxy-card">
+    <span class="proxy-url">🟢 Active: %s</span>
+    <div class="actions">
+        <a href="/quarantine/%s/%s" class="btn quarantine">Quarantine</a>
+        <a href="/delete/%s/%s" class="btn delete">Delete</a>
+    </div>
+</div>`,
+					proxy,
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy)))
 			}
 
 			html.WriteString("</li>")
