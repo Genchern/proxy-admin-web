@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v3"
+	"gopkg.in/yaml.v3"
 )
 
 // ProxyFile связывает страну с файлом
@@ -25,10 +26,62 @@ var (
 	filesMutex sync.RWMutex // безопасность при обновлениях
 )
 
+type ProxyStats struct {
+	Total   int `yaml:"total"`
+	Success int `yaml:"success"`
+}
+
+var (
+	statsMutex sync.RWMutex
+	proxyStats = make(map[string]*ProxyStats)
+)
+
+// В начале файла main.go
+type ProxyStatus struct {
+	Proxy  string
+	Status string // peer / quarantine / autoquarantine / locked
+}
+
+var (
+	lockedProxies = make(map[string]bool) // proxy -> locked?
+	lockMutex     sync.Mutex
+)
+
 var mu sync.Mutex
 
 func main() {
 	loadProxyFiles() // первый раз загружаем файлы
+
+	err := loadLockedProxies()
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("Не могу загрузить заблокированные прокси: %v", err)
+	}
+
+	// Создаём папку logs, если её нет
+	if _, err := os.Stat("logs"); os.IsNotExist(err) {
+		err := os.Mkdir("logs", 0755)
+		if err != nil {
+			log.Fatalf("Не могу создать папку logs: %v", err)
+		}
+	}
+
+	// Создаём proxy_stats.yaml, если его нет
+	if _, err := os.Stat("logs/proxy_stats.yaml"); os.IsNotExist(err) {
+		emptyData, err := yaml.Marshal(map[string]ProxyStats{})
+		if err != nil {
+			log.Printf("Ошибка при создании пустого YAML: %v", err)
+			return
+		}
+		err = os.WriteFile("logs/proxy_stats.yaml", emptyData, 0644)
+		if err != nil {
+			log.Printf("Ошибка при создании файла proxy_stats.yaml: %v", err)
+		}
+	}
+
+	er := loadProxyStats() // загружаем статистику прокси
+	if er != nil && !os.IsNotExist(er) {
+		log.Printf("Не могу загрузить статистику прокси: %v", er)
+	}
 	app := fiber.New()
 
 	// Обслуживание статики (заменяет app.Static)
@@ -124,11 +177,44 @@ func main() {
 
 	app.Get("/dequarantine/:country/:proxy", dequarantineProxy)
 
+	app.Get("/lock/:country/:proxy", lockProxy)
+
+	app.Get("/unlock/:country/:proxy", unlockProxy)
+
 	// Дашборд
 	app.Get("/dashboard", dashboard)
 
 	// Запуск авто-карантина (заглушка)
 	go autoQuarantineCheck()
+
+	// === Периодическое сохранение статистики ===
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				err := saveProxyStats()
+				if err != nil {
+					log.Printf("Ошибка сохранения статистики: %v", err)
+				} else {
+					log.Println("Статистика прокси успешно сохранена")
+				}
+			}
+		}
+	}()
+
+	// Горутина для периодического сохранения заблокированных прокси
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			err := saveLockedProxies()
+			if err != nil {
+				log.Printf("Ошибка сохранения locked_proxies.yaml: %v", err)
+			}
+		}
+	}()
 
 	log.Println("Server started on http://localhost:3000")
 	app.Listen(":3000")
@@ -158,6 +244,90 @@ func loadProxyFiles() {
 	}
 }
 
+func loadProxyStats() error {
+	data, err := os.ReadFile("logs/proxy_stats.yaml")
+	if err != nil {
+		log.Printf("Не могу прочитать статистику: %v", err)
+		return err
+	}
+
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+
+	var rawStats map[string]ProxyStats
+	err = yaml.Unmarshal(data, &rawStats)
+	if err != nil {
+		log.Printf("Ошибка при парсинге YAML: %v", err)
+		return err
+	}
+
+	proxyStats = make(map[string]*ProxyStats)
+	for key, val := range rawStats {
+		tmp := val
+		proxyStats[key] = &tmp
+	}
+
+	return nil
+}
+
+func saveProxyStats() error {
+	statsMutex.RLock()
+	defer statsMutex.RUnlock()
+
+	// Преобразуем карту указателей в карту структур для корректного YAML
+	tempMap := make(map[string]ProxyStats)
+	for key, val := range proxyStats {
+		if val != nil {
+			tempMap[key] = *val
+		} else {
+			tempMap[key] = ProxyStats{}
+		}
+	}
+
+	data, err := yaml.Marshal(tempMap)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile("logs/proxy_stats.yaml", data, 0644)
+}
+
+func getSuccessRate(proxy string) float64 {
+	statsMutex.RLock()
+	defer statsMutex.RUnlock()
+
+	stats, ok := proxyStats[proxy]
+	if !ok || stats == nil || stats.Total == 0 {
+		return 0
+	}
+	return float64(stats.Success) / float64(stats.Total) * 100
+}
+
+// func autoQuarantineCheck() {
+// 	ticker := time.NewTicker(10 * time.Second)
+// 	defer ticker.Stop()
+// 	for range ticker.C {
+// 		statsMutex.RLock()
+// 		// Получаем список всех прокси
+// 		for _, pf := range proxyFiles {
+// 			proxies, _ := getProxiesFromFile(pf.File)
+// 			for _, proxy := range proxies {
+// 				// Пропускаем прокси, которые в состоянии locked
+// 				if isProxyLocked(proxy) {
+// 					continue
+// 				}
+
+// 				if isUnreachable(proxy) {
+// 					setAutoQuarantine(pf.File, proxy)
+// 				} else {
+// 					outAutoQuarantine(pf.File, proxy)
+// 				}
+// 			}
+// 		}
+// 		statsMutex.RUnlock()
+// 	}
+// }
+
 func autoQuarantineCheck() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -166,6 +336,11 @@ func autoQuarantineCheck() {
 		for _, pf := range proxyFiles {
 			proxies, _ := getProxiesFromFile(pf.File)
 			for _, proxy := range proxies {
+				// Пропускаем прокси, которые в состоянии locked
+				if isProxyLocked(proxy) {
+					isUnreachable(proxy)
+					continue
+				}
 				if isUnreachable(proxy) {
 					setAutoQuarantine(pf.File, proxy)
 				} else {
@@ -175,6 +350,24 @@ func autoQuarantineCheck() {
 		}
 	}
 }
+
+// func autoQuarantineCheck() {
+// 	ticker := time.NewTicker(30 * time.Second)
+// 	defer ticker.Stop()
+
+// 	for range ticker.C {
+// 		for _, pf := range proxyFiles {
+// 			proxies, _ := getProxiesFromFile(pf.File)
+// 			for _, proxy := range proxies {
+// 				if isUnreachable(proxy) {
+// 					setAutoQuarantine(pf.File, proxy)
+// 				} else {
+// 					outAutoQuarantine(pf.File, proxy)
+// 				}
+// 			}
+// 		}
+// 	}
+// }
 
 func isUnreachable(proxy string) bool {
 	proxyURL, err := url.Parse(proxy)
@@ -191,12 +384,50 @@ func isUnreachable(proxy string) bool {
 		Timeout: 5 * time.Second,
 	}
 
-	resp, err := client.Get("https://ipinfo.io/json")
-	if err != nil || resp.StatusCode != 200 {
-		return true
+	resp, err := client.Get("https://ipinfo.io/json ")
+
+	statsMutex.Lock()
+	defer statsMutex.Unlock()
+
+	// Если прокси ещё не был в карте — добавляем его с нулевыми значениями
+	if proxyStats[proxy] == nil {
+		proxyStats[proxy] = &ProxyStats{}
 	}
-	return false
+
+	// Увеличиваем общее число проверок
+	proxyStats[proxy].Total++
+
+	// Если ответ успешный — увеличиваем счётчик успехов
+	if err == nil && resp.StatusCode == 200 {
+		proxyStats[proxy].Success++
+	} else {
+		// Не увеличивай ошибки, просто оставь как есть
+	}
+
+	return err != nil || resp.StatusCode != 200
 }
+
+// func isUnreachable(proxy string) bool {
+// 	proxyURL, err := url.Parse(proxy)
+// 	if err != nil {
+// 		return true
+// 	}
+
+// 	client := &http.Client{
+// 		Transport: &http.Transport{
+// 			Proxy:           http.ProxyURL(proxyURL),
+// 			MaxIdleConns:    10,
+// 			IdleConnTimeout: 5 * time.Second,
+// 		},
+// 		Timeout: 5 * time.Second,
+// 	}
+
+// 	resp, err := client.Get("https://ipinfo.io/json")
+// 	if err != nil || resp.StatusCode != 200 {
+// 		return true
+// 	}
+// 	return false
+// }
 
 func getProxiesFromFile(filePath string) ([]string, error) {
 	data, err := os.ReadFile(filePath)
@@ -433,9 +664,11 @@ func dashboard(c fiber.Ctx) error {
     border-radius: 8px;
     box-shadow: 0 2px 6px rgba(0,0,0,0.1);
     font-family: monospace;
+	border-left: 4px solid rgb(28, 180, 49);
     white-space: nowrap;        /* Запрещаем перенос текста */
     width: 100%;                /* На всю ширину */
     max-width: 100%;
+	font-size: 16px;
     overflow-x: auto;           /* Добавляем горизонтальный скролл при необходимости */
 }
 .proxy-card.quarantined {
@@ -447,6 +680,18 @@ func dashboard(c fiber.Ctx) error {
     border-left: 4px solid #ffc107;
     color: #856404;
     background-color: #fff3cd;
+}
+.proxy-card.locked {
+    border-left: 4px solid rgb(28, 180, 49);
+    color: rgb(39, 38, 38);
+    background-color: #fff;
+}
+/* SVG или Font Awesome для замка */
+.lock-icon {
+    width: 16px;
+    height: 16px;
+    vertical-align: middle;
+    margin-right: 5px;
 }
 .proxy-url {
     display: block;
@@ -481,6 +726,35 @@ func dashboard(c fiber.Ctx) error {
 .btn:hover {
     opacity: 0.9;
 }
+
+.btn.lock {
+    background-color: #343a40;
+}
+.btn.unlock {
+    background-color: #28a745;
+}
+
+.status-icon {
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.status-icon.active circle {
+  fill: lime; /* или #28a745 — зелёный */
+}
+
+.lock-icon {
+  vertical-align: middle;
+  margin-right: 4px;
+}
+// .stats {
+//     position: absolute;
+//     bottom: 8px;
+//     right: 10px;
+//     font-size: 14px;
+//     color: #28a745;
+//     font-weight: bold;
+// }
 </style>
 </head>
 <body>`)
@@ -540,13 +814,33 @@ setTimeout(function() {
 <button type="submit">Add Country</button>
 </form>`)
 
+	html.WriteString("<ul style=\"list-style: none; padding: 0; margin: 0; width: 33%;\">")
+
 	for country, proxies := range proxyMap {
 		html.WriteString(fmt.Sprintf("<h2>%s</h2><ul>", country))
 
 		for _, proxy := range proxies {
-			html.WriteString("<li>")
+			html.WriteString("<li style=\"width: 100%;\">")
+			percentage := getSuccessRate(proxy)
 
-			if strings.HasPrefix(proxy, "autoquarantine ") {
+			if isProxyLocked(proxy) {
+				html.WriteString(fmt.Sprintf(`
+<div class="proxy-card locked">
+    <span class="proxy-url">🟢🔒 Activelocked: %s</span>
+    <div class="actions">
+        <a href="/quarantine/%s/%s" class="btn quarantine">Quarantine</a>
+    	<a href="/delete/%s/%s" class="btn delete">Delete</a>
+        <a href="/unlock/%s/%s" class="btn unlock">🔓 Unlock</a>
+    </div>
+	<div class="stats">✅ %.2f%%</div>
+</div>`,
+					proxy,
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					percentage))
+
+			} else if strings.HasPrefix(proxy, "autoquarantine ") {
 				cleanProxy := proxy[14:] // убираем "autoquarantine "
 				html.WriteString(fmt.Sprintf(`
 <div class="proxy-card autoquarantined">
@@ -554,11 +848,15 @@ setTimeout(function() {
     <div class="actions">
         <a href="/dequarantine/%s/%s" class="btn restore">Restore</a>
         <a href="/delete/%s/%s" class="btn delete">Delete</a>
+		<a href="/lock/%s/%s" class="btn lock">🔒 Lock</a>
     </div>
+	<div class="stats">✅ %.2f%%</div>
 </div>`,
 					cleanProxy,
 					url.QueryEscape(country), url.QueryEscape(proxy),
-					url.QueryEscape(country), url.QueryEscape(proxy)))
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					percentage))
 
 			} else if strings.HasPrefix(proxy, "quarantine ") {
 				cleanProxy := proxy[11:] // убираем "quarantine "
@@ -582,10 +880,12 @@ setTimeout(function() {
         <a href="/quarantine/%s/%s" class="btn quarantine">Quarantine</a>
         <a href="/delete/%s/%s" class="btn delete">Delete</a>
     </div>
+	<div class="stats">✅ %.2f%%</div>
 </div>`,
 					proxy,
 					url.QueryEscape(country), url.QueryEscape(proxy),
-					url.QueryEscape(country), url.QueryEscape(proxy)))
+					url.QueryEscape(country), url.QueryEscape(proxy),
+					percentage))
 			}
 
 			html.WriteString("</li>")
@@ -887,4 +1187,167 @@ func isProxyExistsInFile(filename string, proxy string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+func lockProxy(c fiber.Ctx) error {
+	country := c.Params("country")
+	proxy := c.Params("proxy")
+
+	decodedProxy, err := url.QueryUnescape(proxy)
+	if err != nil {
+		decodedProxy = proxy
+	}
+
+	// Убираем возможные префиксы
+	cleanProxy := decodedProxy
+	if strings.HasPrefix(decodedProxy, "autoquarantine ") {
+		cleanProxy = strings.TrimSpace(strings.TrimPrefix(decodedProxy, "autoquarantine "))
+	} else if strings.HasPrefix(decodedProxy, "quarantine ") {
+		cleanProxy = strings.TrimSpace(strings.TrimPrefix(decodedProxy, "quarantine "))
+	}
+
+	for _, pf := range proxyFiles {
+		if pf.Country == country {
+			err := setProxyToPeer(pf.File, cleanProxy)
+			if err != nil {
+				log.Printf("Ошибка перевода в peer: %v", err)
+			} else {
+				lockMutex.Lock()
+				lockedProxies[cleanProxy] = true // ✅ Чистый адрес
+				lockMutex.Unlock()
+
+				err = saveLockedProxies()
+				if err != nil {
+					log.Printf("Ошибка сохранения locked_proxies.yaml: %v", err)
+				} else {
+					log.Println("locked_proxies.yaml успешно обновлён")
+				}
+			}
+		}
+	}
+
+	return c.Redirect().To("/dashboard")
+}
+
+// func unlockProxy(c fiber.Ctx) error {
+// 	country := c.Params("country")
+// 	proxy := c.Params("proxy")
+
+// 	for _, pf := range proxyFiles {
+// 		if pf.Country == country {
+// 			setAutoQuarantine(pf.File, proxy)
+// 		}
+// 	}
+
+// 	lockMutex.Lock()
+// 	delete(lockedProxies, proxy)
+// 	lockMutex.Unlock()
+
+// 	return c.Redirect().To("/dashboard")
+// }
+
+func unlockProxy(c fiber.Ctx) error {
+	// country := c.Params("country")
+	proxy := c.Params("proxy")
+
+	decodedProxy, err := url.QueryUnescape(proxy)
+	if err != nil {
+		decodedProxy = proxy
+	}
+
+	// Убираем возможные префиксы
+	cleanProxy := decodedProxy
+	if strings.HasPrefix(decodedProxy, "autoquarantine ") {
+		cleanProxy = strings.TrimSpace(strings.TrimPrefix(decodedProxy, "autoquarantine "))
+	} else if strings.HasPrefix(decodedProxy, "quarantine ") {
+		cleanProxy = strings.TrimSpace(strings.TrimPrefix(decodedProxy, "quarantine "))
+	}
+
+	// УДАЛЯЕМ прокси из locked_proxies.yaml
+	lockMutex.Lock()
+	delete(lockedProxies, cleanProxy) // удаляем по чистому адресу
+	lockMutex.Unlock()
+
+	// СОХРАНЯЕМ обновлённый список
+	err = saveLockedProxies()
+	if err != nil {
+		log.Printf("Ошибка сохранения locked_proxies.yaml: %v", err)
+	}
+
+	return c.Redirect().To("/dashboard")
+}
+
+func setProxyToPeer(filename string, proxy string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "autoquarantine ") || strings.HasPrefix(line, "quarantine ") {
+			existingProxy := strings.TrimSpace(strings.TrimPrefix(line, "autoquarantine "))
+			existingProxy = strings.TrimSpace(strings.TrimPrefix(existingProxy, "quarantine "))
+
+			if existingProxy == proxy {
+				lines = append(lines, "peer "+proxy)
+				continue
+			}
+		}
+		lines = append(lines, line)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+}
+
+func isProxyLocked(proxy string) bool {
+	lockMutex.Lock()
+	defer lockMutex.Unlock()
+	_, ok := lockedProxies[proxy]
+	return ok
+}
+
+func saveLockedProxies() error {
+	lockMutex.Lock()
+	defer lockMutex.Unlock()
+
+	data, err := yaml.Marshal(lockedProxies)
+	// fmt.Print(data)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile("logs/locked_proxies.yaml", data, 0644)
+}
+
+func loadLockedProxies() error {
+	data, err := os.ReadFile("logs/locked_proxies.yaml")
+	if err != nil {
+		log.Printf("Не могу прочитать locked_proxies.yaml: %v", err)
+		return err
+	}
+
+	lockMutex.Lock()
+	defer lockMutex.Unlock()
+
+	var loaded map[string]bool
+	err = yaml.Unmarshal(data, &loaded)
+	if err != nil {
+		log.Printf("Ошибка при разборе YAML: %v", err)
+		return err
+	}
+
+	lockedProxies = loaded
+	return nil
 }

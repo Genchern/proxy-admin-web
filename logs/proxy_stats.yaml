@@ -1,0 +1,12 @@
+socks5h://user_de1:pass_de1@192.168.1.20:1080:
+    total: 59
+    success: 0
+socks5h://user_ru1:pass_ru1@192.168.1.20:1080:
+    total: 1
+    success: 0
+socks5h://user_ru2:pass_ru2@192.168.1.21:1080:
+    total: 1
+    success: 0
+socks5h://user_us1:pass_us1@192.168.1.20:1080:
+    total: 1
+    success: 0

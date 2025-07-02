@@ -1,1 +1,1 @@
-autoquarantine  socks5h://user_us1:pass_us1@192.168.1.20:1080
+peer socks5h://user_us1:pass_us1@192.168.1.20:1080
